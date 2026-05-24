@@ -6,6 +6,7 @@ metadata is stored in the ``meta`` dict.
 
 from __future__ import annotations
 
+import copy
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -23,6 +24,7 @@ class Context:
     request: web.Request
     raw_body: bytes = b""
     req_body: dict | None = None
+    fwd_body: dict | None = None
     fwd_headers: dict = field(default_factory=dict)
     req_id: str = ""
 
@@ -46,6 +48,8 @@ class Context:
     def __post_init__(self) -> None:
         self._t0 = time.monotonic()
         self.req_id = f"req_{uuid.uuid4().hex[:REQUEST_ID_LENGTH]}"
+        if self.fwd_body is None and self.req_body is not None:
+            self.fwd_body = copy.deepcopy(self.req_body)
 
     @property
     def elapsed_ms(self) -> int:
