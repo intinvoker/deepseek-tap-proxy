@@ -36,13 +36,13 @@ shared/ (SSE/Trace/Headers/Decompress) → pipeline (Context/Stage/Pipeline) →
 
 | 格式 | 路由 | Session 类型 |
 |------|------|-------------|
-| OpenAI | `POST /chat/completions` | Copilot / Hermes / Generic |
+| OpenAI | `POST /chat/completions`, `/v1/chat/completions` | Copilot / Hermes / Generic |
 | Anthropic | `ANY /anthropic/{path}` | Claude Code |
 
 ## 使用
 
 ```bash
-curl http://localhost:11808/v1/chat/completions \
+curl http://localhost:11808/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_KEY" \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'

@@ -5,3 +5,4 @@ from deepseek_tap_proxy.openai.handler import chat_completions_handler
 
 def setup_openai_routes(app: web.Application) -> None:
     app.router.add_post("/chat/completions", chat_completions_handler)
+    app.router.add_post("/v1/chat/completions", chat_completions_handler)
