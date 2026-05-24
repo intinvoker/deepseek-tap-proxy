@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepseek-tap-proxy"
+version = "0.1.0"
+description = "Multi-format AI API proxy with pipeline architecture"
+readme = "README.md"
+license = {text = "AGPL-3.0"}
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.9",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: Proxy Servers",
+]
+
+[project.urls]
+Repository = "https://github.com/intinvoker/deepseek-tap-proxy"
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+deepseek-tap-proxy = "deepseek_tap_proxy.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
