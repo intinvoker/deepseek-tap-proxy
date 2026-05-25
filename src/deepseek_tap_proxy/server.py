@@ -53,6 +53,7 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
 
     app.on_shutdown.append(lambda _: asyncio.gather(
         _close_writer(writer), _close_session(client_session),
+        _wait_persists(app),
         return_exceptions=True,
     ))
 
@@ -104,3 +105,11 @@ async def _close_writer(writer: TraceWriter) -> None:
 
 async def _close_session(session: aiohttp.ClientSession) -> None:
     await session.close()
+
+
+async def _wait_persists(app: web.Application) -> None:
+    """Await any pending persist tasks before shutdown."""
+    proxy_ctx = app.get("proxy_ctx", {})
+    persists: set[asyncio.Task] = proxy_ctx.get("_pending_persists", set())
+    if persists:
+        await asyncio.gather(*persists, return_exceptions=True)

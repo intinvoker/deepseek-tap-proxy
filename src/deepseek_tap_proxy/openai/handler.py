@@ -31,14 +31,19 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
     pipeline: Pipeline = _build_pipeline(msg0_enabled, prefix_enabled)
     ctx = await pipeline.execute(ctx)
 
-    # Background persist (fire-and-forget)
+    # Background persist (tracked for completion during shutdown)
     db = request.app.get("db")
-    writer_ctx = request.app.get("proxy_ctx", {})
-    writer: TraceWriter | None = writer_ctx.get("writer")
+    proxy_ctx = request.app.get("proxy_ctx", {})
+    writer: TraceWriter | None = proxy_ctx.get("writer")
+    persists: set[asyncio.Task] = proxy_ctx.setdefault("_pending_persists", set())
     if db:
-        asyncio.create_task(_persist_phase1(ctx, db))
+        t1 = asyncio.create_task(_persist_phase1(ctx, db))
+        persists.add(t1)
+        t1.add_done_callback(persists.discard)
     if db and writer:
-        asyncio.create_task(_persist_phase2(ctx, db, writer))
+        t2 = asyncio.create_task(_persist_phase2(ctx, db, writer))
+        persists.add(t2)
+        t2.add_done_callback(persists.discard)
 
     if ctx.response is not None:
         return ctx.response
