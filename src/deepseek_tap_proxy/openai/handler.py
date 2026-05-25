@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -71,7 +72,19 @@ def _build_pipeline(msg0_enabled: bool = True, prefix_enabled: bool = False) -> 
 
 
 def _build_trace_record(ctx: Context) -> dict:
-    """Build a full trace record from pipeline context."""
+    """Build a full trace record from pipeline context.
+
+    When a lock (msg0/prefix) modified the request, the trace stores what was
+    actually sent upstream (parsed from raw_body), so downstream readers like
+    PrefixLock see the locked version, not the tampered original.
+    """
+    trace_body = ctx.req_body
+    if ctx.meta.get("modified"):
+        try:
+            trace_body = json.loads(ctx.raw_body)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass  # fall back to req_body
+
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request_id": ctx.req_id,
@@ -81,7 +94,7 @@ def _build_trace_record(ctx: Context) -> dict:
             "method": "POST",
             "path": "/chat/completions",
             "headers": redact(dict(ctx.request.headers)),
-            "body": ctx.req_body,
+            "body": trace_body,
         },
         "response": {
             "status": ctx.status,

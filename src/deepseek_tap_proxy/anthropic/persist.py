@@ -57,7 +57,9 @@ async def persist_anthropic(ctx: Context, db, writer) -> None:
         except Exception:
             log.exception("[%s] phase1 insert failed", ctx.req_id)
 
-    # JSONL: use req_body (raw request)
+    # JSONL: use fwd_body when modified (stages like Normalize/Block0Clear/Baseline
+    # write to fwd_body; req_body is the original). When unmodified, req_body = fwd_body.
+    trace_body = ctx.fwd_body if ctx.fwd_body is not None else ctx.req_body
     try:
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -69,7 +71,7 @@ async def persist_anthropic(ctx: Context, db, writer) -> None:
                 "method": "POST",
                 "path": "/v1/messages",
                 "headers": redact(dict(ctx.request.headers)),
-                "body": ctx.req_body,
+                "body": trace_body,
             },
             "response": {
                 "status": ctx.status,
