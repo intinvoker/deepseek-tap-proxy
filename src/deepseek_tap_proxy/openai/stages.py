@@ -533,7 +533,7 @@ def compute_cache_analysis(
         if isinstance(tools, list):
             prompt_tools_count = len(tools)
 
-    cache_hit_ratio = (cache_hit / prompt_tokens) if prompt_tokens > 0 else 0.0
+    cache_hit_ratio = (cache_hit / (cache_hit + cache_miss)) if (cache_hit + cache_miss) > 0 else 0.0
 
     return {
         "cache_hit_tokens": cache_hit,

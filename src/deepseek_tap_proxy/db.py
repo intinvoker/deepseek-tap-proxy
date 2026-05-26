@@ -40,6 +40,11 @@ class Database:
         create_anthropic_tables(conn)
         conn.commit()
 
+    def close(self) -> None:
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
+
 
 def _create_unified_tables(conn: sqlite3.Connection) -> None:
     """Create the shared requests table with columns for all API formats.
@@ -47,7 +52,7 @@ def _create_unified_tables(conn: sqlite3.Connection) -> None:
     Uses IF NOT EXISTS so subsequent format-specific CREATE TABLE
     calls are harmless no-ops.
     """
-    conn.executescript("""
+    conn.executescript('''
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id TEXT UNIQUE NOT NULL,
@@ -88,10 +93,5 @@ def _create_unified_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_requests_cache_ratio ON requests(cache_hit_ratio);
         CREATE INDEX IF NOT EXISTS idx_requests_session_fp ON requests(session_fingerprint);
         CREATE INDEX IF NOT EXISTS idx_requests_session_uuid ON requests(session_uuid);
+    ''')
 
-    """)
-
-    def close(self) -> None:
-        if hasattr(self._local, "conn") and self._local.conn:
-            self._local.conn.close()
-            self._local.conn = None

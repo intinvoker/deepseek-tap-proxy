@@ -139,7 +139,8 @@ def update_phase2(conn: sqlite3.Connection, *, req_id: str, duration_ms: int,
     """Phase 2: fill response data, set 'completed'."""
     total = input_tokens + output_tokens
     cache_miss = cache_creation_tokens
-    ratio = round(cache_hit_tokens / input_tokens, 4) if input_tokens > 0 else 0.0
+    total_cache = cache_hit_tokens + cache_creation_tokens
+    ratio = round(cache_hit_tokens / total_cache, 4) if total_cache > 0 else 0.0
     sets = """
         duration_ms = ?, status_code = ?,
         prompt_tokens = ?, completion_tokens = ?, total_tokens = ?,
