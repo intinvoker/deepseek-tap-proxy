@@ -203,7 +203,8 @@ class ParseStage(Stage):
                                 ctx.meta["session_uuid"] = hermes_id.group(1)
 
         proxy_ctx = ctx.request.app.get("proxy_ctx", {})
-        ctx.target_url = proxy_ctx.get("target_url", "")
+        if not ctx.target_url:
+            ctx.target_url = proxy_ctx.get("target_url", "")
 
         db = ctx.request.app.get("db")
         msg_hash_chain = ctx.meta.get("msg_hash_chain")
@@ -384,7 +385,11 @@ class ForwardStage(Stage):
     async def process(self, ctx: Context) -> Context:
         proxy_ctx = ctx.request.app.get("proxy_ctx", {})
         session: aiohttp.ClientSession = proxy_ctx.get("session")
-        target: str = proxy_ctx.get("target_url", "")
+        upstream = ctx.request.get("upstream")
+        if upstream is None:
+            target = proxy_ctx.get("target_url", "")
+        else:
+            target = upstream.target_url
         timeout_sec: int = proxy_ctx.get("timeout", 600)
 
         if not session or not target:
@@ -392,7 +397,9 @@ class ForwardStage(Stage):
             ctx.response = web.Response(status=502, text="Upstream not configured")
             return ctx
 
-        upstream_url = target.rstrip("/") + "/chat/completions"
+        upstream_url = target.rstrip("/") + ctx.request.path
+        if upstream is not None:
+            ctx.meta["upstream_name"] = upstream.upstream_name
 
         try:
             upstream_resp = await session.request(

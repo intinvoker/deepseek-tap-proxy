@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 from datetime import datetime, timezone
 
 from aiohttp import web
 
 from deepseek_tap_proxy.pipeline import Context, Pipeline
+from deepseek_tap_proxy.router import ResolvedTarget
 from deepseek_tap_proxy.openai.stages import (
     ParseStage, Msg0LockStage, PrefixLockStage, ForwardStage, ReturnStage,
 )
@@ -22,7 +24,27 @@ log: logging.Logger = logging.getLogger("deepseek-tap")
 
 async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
     """Handle /chat/completions via the request pipeline."""
+    # Resolve upstream target via router (config-driven) or fallback to --target
+    proxy_ctx = request.app.get("proxy_ctx", {})
+    router = proxy_ctx.get("router")
+    resolved = None
+    if router is not None and router.is_available:
+        resolved = router.resolve(request.headers.get("Authorization"))
+    if resolved is None:
+        resolved = ResolvedTarget(
+            target_url=proxy_ctx.get("target_url", ""),
+            upstream_name="default",
+            matched_key_prefix=None,
+        )
+    request["upstream"] = resolved
+    log.debug(
+        f"[upstream] POST /v1/chat/completions → "
+        f"{resolved.upstream_name} "
+        f"({'prefix ' + resolved.matched_key_prefix if resolved.matched_key_prefix else 'default'})"
+    )
+
     ctx = Context(request=request)
+    ctx.target_url = resolved.target_url
 
     config = request.app.get("config", {})
     lock_mode = getattr(config, "lock_mode", "msg0")
@@ -90,9 +112,10 @@ def _build_trace_record(ctx: Context) -> dict:
         "request_id": ctx.req_id,
         "duration_ms": ctx.duration_ms or ctx.elapsed_ms,
         "upstream_base_url": ctx.target_url,
+        "upstream_name": ctx.meta.get("upstream_name", "default"),
         "request": {
             "method": "POST",
-            "path": "/chat/completions",
+            "path": ctx.request.path,
             "headers": redact(dict(ctx.request.headers)),
             "body": trace_body,
         },
@@ -122,7 +145,6 @@ def _build_trace_record(ctx: Context) -> dict:
 
 
 def _get_conn(db) -> sqlite3.Connection:
-    import sqlite3
     return db.conn if hasattr(db, 'conn') else db
 
 

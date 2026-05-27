@@ -1,0 +1,16 @@
+# Upstream API routing configuration — rename to upstreams.yaml to enable
+# Proxy reads this file on startup. Edit and restart to apply changes.
+
+default: deepseek
+
+upstreams:
+  deepseek:
+    target: https://api.deepseek.com
+    keys:
+      - "sk-deepseek-"
+      - "sk-"
+
+  xiaomi:
+    target: https://token-plan-cn.xiaomimimo.com
+    keys:
+      - "tp-"

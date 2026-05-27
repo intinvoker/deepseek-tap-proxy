@@ -16,6 +16,7 @@ class ProxyConfig:
     db_path: str = "./data/proxy.db"
     lock_mode: str = "msg0"
     log_level: str = "INFO"
+    upstreams_config: str = ""  # path to upstreams.yaml, empty = router disabled
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> "ProxyConfig":
@@ -33,12 +34,16 @@ class ProxyConfig:
             "--lock-mode", choices=["msg0", "prefix", "none"], default="msg0",
         )
         parser.add_argument("--log-level", default="INFO")
+        parser.add_argument(
+            "--upstreams-config", default="",
+            help="Path to upstreams.yaml (multi-upstream routing config)",
+        )
         args = parser.parse_args(argv)
         cfg = cls(
             port=args.port, host=args.host, target=args.target,
             timeout=args.timeout, trace_dir=args.trace_dir,
             db_path=args.db_path, lock_mode=args.lock_mode,
-            log_level=args.log_level,
+            log_level=args.log_level, upstreams_config=args.upstreams_config,
         )
         cfg.trace_dir = str(Path(cfg.trace_dir).resolve())
         cfg.db_path = str(Path(cfg.db_path).resolve())

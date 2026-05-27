@@ -11,6 +11,7 @@ from deepseek_tap_proxy.config import ProxyConfig
 from deepseek_tap_proxy.db import Database
 from deepseek_tap_proxy.shared.trace import TraceWriter
 from deepseek_tap_proxy.shared.headers import HOP_BY_HOP
+from deepseek_tap_proxy.router import UpstreamRouter
 from deepseek_tap_proxy.openai.routes import setup_openai_routes
 from deepseek_tap_proxy.anthropic.routes import setup_anthropic_routes
 
@@ -30,12 +31,16 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
         headers={"User-Agent": "DeepSeekTap/0.1"},
     )
 
+    # Load upstream router (config file driven, disabled if no config)
+    router = UpstreamRouter(config.upstreams_config or None)
+
     app["proxy_ctx"] = {
         "writer": writer,
         "session": client_session,
         "target_url": config.target,
         "timeout": config.timeout,
         "session_id": session_id,
+        "router": router,
     }
     app["db"] = db
     app["db_conn"] = db.conn
@@ -45,9 +50,15 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     setup_openai_routes(app)
     setup_anthropic_routes(app)
 
-    app.router.add_get("/v1/models", _proxy_get_handler)
-    app.router.add_get("/models", _proxy_get_handler)
-    app.router.add_get("/v1", _proxy_get_handler)
+    # Wrap GET handlers with upstream resolution
+    async def _proxy_get_with_upstream(request: web.Request) -> web.Response:
+        upstream = await _resolve_upstream_for_request(request)
+        request["upstream"] = upstream
+        return await _proxy_get_handler(request)
+
+    app.router.add_get("/v1/models", _proxy_get_with_upstream)
+    app.router.add_get("/models", _proxy_get_with_upstream)
+    app.router.add_get("/v1", _proxy_get_with_upstream)
     if add_health:
         app.router.add_get("/health", _health_handler)
 
@@ -62,14 +73,42 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     log.info(f"Database: {config.db_path}")
     log.info(f"Listening on {config.host}:{config.port}")
     log.info(f"Upstream: {config.target}")
+    if router.is_available:
+        log.info(f"Upstream router: {config.upstreams_config}")
+    else:
+        log.info("Upstream router: disabled (no config)")
 
     return app
+
+
+async def _resolve_upstream_for_request(request: web.Request):
+    """Resolve upstream for GET passthrough requests (no pipeline)."""
+    from deepseek_tap_proxy.router import ResolvedTarget
+    proxy_ctx = request.app.get("proxy_ctx", {})
+    router = proxy_ctx.get("router")
+    if router is not None and router.is_available:
+        resolved = router.resolve(request.headers.get("Authorization"))
+        if resolved is not None:
+            return resolved
+    return ResolvedTarget(
+        target_url=proxy_ctx.get("target_url", ""),
+        upstream_name="default",
+        matched_key_prefix=None,
+    )
 
 
 async def _proxy_get_handler(request: web.Request) -> web.Response:
     proxy_ctx = request.app["proxy_ctx"]
     session: aiohttp.ClientSession = proxy_ctx["session"]
-    target: str = proxy_ctx["target_url"]
+
+    # Read resolved upstream from request (set by wrapper)
+    upstream = request.get("upstream")
+    if upstream is not None:
+        target = upstream.target_url
+    else:
+        target = proxy_ctx.get("target_url", "")
+
+    log.debug(f"[upstream] GET {request.path} → {upstream.upstream_name if upstream else 'default'}")
 
     fwd_headers = dict(request.headers)
     fwd_headers.pop("Host", None)

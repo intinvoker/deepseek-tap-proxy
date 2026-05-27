@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import re
-import uuid
 
 import aiohttp
 from aiohttp import web
@@ -73,7 +72,8 @@ class AnthropicParseStage(Stage):
         ctx.fwd_headers = fwd_headers
 
         proxy_ctx = ctx.request.app.get("proxy_ctx", {})
-        ctx.target_url = proxy_ctx.get("target_url", "")
+        if not ctx.target_url:
+            ctx.target_url = proxy_ctx.get("target_url", "")
         ctx.timeout = proxy_ctx.get("timeout", 600)
 
         # Extract Claude-Code session ID for persist and baseline
@@ -81,8 +81,9 @@ class AnthropicParseStage(Stage):
               ctx.request.headers.get("x-claude-code-session-id", "")
         ctx.meta["anthropic_sid"] = sid
 
-        # Upstream base URL for persist
-        ctx.meta["upstream_base_url"] = proxy_ctx.get("target_url", "")
+        # Upstream base URL for persist (only set if handler didn't already)
+        if "upstream_base_url" not in ctx.meta:
+            ctx.meta["upstream_base_url"] = proxy_ctx.get("target_url", "")
 
         model = (ctx.req_body or {}).get("model", "?")
         log.info(
@@ -291,7 +292,11 @@ class AnthropicBaselineStage(Stage):
 class AnthropicForwardStage(Stage):
     async def process(self, ctx: Context) -> Context:
         proxy_ctx = ctx.request.app.get("proxy_ctx", {})
-        target = proxy_ctx.get("target_url", "")
+        upstream = ctx.request.get("upstream")
+        if upstream is None:
+            target = proxy_ctx.get("target_url", "")
+        else:
+            target = upstream.target_url
         timeout = proxy_ctx.get("timeout", 600)
 
         if not target:
@@ -303,6 +308,9 @@ class AnthropicForwardStage(Stage):
         if req_path.startswith("/anthropic"):
             req_path = req_path[len("/anthropic"):]
         upstream_url = target.rstrip("/") + "/anthropic" + req_path
+
+        if upstream is not None:
+            ctx.meta["upstream_name"] = upstream.upstream_name
 
         max_attempts = 2
         upstream_resp = None

@@ -66,10 +66,11 @@ async def persist_anthropic(ctx: Context, db, writer) -> None:
             "request_id": ctx.req_id,
             "duration_ms": ctx.duration_ms or 0,
             "upstream_base_url": ctx.meta.get("upstream_base_url", ""),
+            "upstream_name": ctx.meta.get("upstream_name", "default"),
             "api_format": "anthropic",
             "request": {
                 "method": "POST",
-                "path": "/v1/messages",
+                "path": ctx.request.path,
                 "headers": redact(dict(ctx.request.headers)),
                 "body": trace_body,
             },

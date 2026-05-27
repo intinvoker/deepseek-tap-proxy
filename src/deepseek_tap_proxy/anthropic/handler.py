@@ -6,6 +6,7 @@ import logging
 from aiohttp import web
 
 from deepseek_tap_proxy.pipeline import Context, Pipeline
+from deepseek_tap_proxy.router import ResolvedTarget
 from deepseek_tap_proxy.anthropic.stages import (
     AnthropicParseStage, AnthropicNormalizeStage, AnthropicBlock0ClearStage,
     AnthropicCanonicalUserStage, AnthropicBaselineStage,
@@ -16,7 +17,28 @@ log = logging.getLogger("deepseek-tap")
 
 
 async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
+    # Resolve upstream target via router (config-driven) or fallback to --target
+    proxy_ctx = request.app.get("proxy_ctx", {})
+    router = proxy_ctx.get("router")
+    resolved = None
+    if router is not None and router.is_available:
+        resolved = router.resolve(request.headers.get("Authorization"))
+    if resolved is None:
+        resolved = ResolvedTarget(
+            target_url=proxy_ctx.get("target_url", ""),
+            upstream_name="default",
+            matched_key_prefix=None,
+        )
+    request["upstream"] = resolved
+    log.debug(
+        f"[upstream] POST /v1/messages → "
+        f"{resolved.upstream_name} "
+        f"({'prefix ' + resolved.matched_key_prefix if resolved.matched_key_prefix else 'default'})"
+    )
+
     ctx = Context(request=request, meta={})
+    ctx.target_url = resolved.target_url
+    ctx.meta["upstream_base_url"] = resolved.target_url
     pipeline = Pipeline([
         AnthropicParseStage(),
         AnthropicNormalizeStage(),
