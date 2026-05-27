@@ -4,7 +4,6 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-
 def create_anthropic_tables(conn: sqlite3.Connection) -> None:
     """Create Anthropic trace tables."""
     conn.executescript("""
