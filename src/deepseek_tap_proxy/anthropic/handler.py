@@ -22,7 +22,9 @@ async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
     router = proxy_ctx.get("router")
     resolved = None
     if router is not None and router.is_available:
-        resolved = router.resolve(request.headers.get("Authorization"))
+        resolved = router.resolve(
+            request.headers.get("Authorization") or request.headers.get("x-api-key")
+        )
     if resolved is None:
         resolved = ResolvedTarget(
             target_url=proxy_ctx.get("target_url", ""),
