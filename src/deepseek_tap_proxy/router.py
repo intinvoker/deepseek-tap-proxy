@@ -14,6 +14,7 @@ class ResolvedTarget:
     target_url: str
     upstream_name: str
     matched_key_prefix: str | None  # None = default fallback
+    path_prefix: str | None = None  # e.g. "/v1/messages" to override upstream path for Messages API
 
 
 class UpstreamRouter:
@@ -28,7 +29,7 @@ class UpstreamRouter:
     def __init__(self, config_path: str | None) -> None:
         self._config_path = config_path
         self._default: str = ""
-        self._upstreams: list[tuple[str, str, list[str]]] = []  # [(name, target, [prefixes])]
+        self._upstreams: list[tuple[str, str, list[str], str | None]] = []  # [(name, target, [prefixes], path_prefix)]
         if config_path:
             self._load(config_path)
 
@@ -54,9 +55,9 @@ class UpstreamRouter:
             target = cfg.get("target", "")
             keys = cfg.get("keys", [])
             if target and keys:
-                self._upstreams.append((name, target, keys))
+                self._upstreams.append((name, target, keys, cfg.get("path_prefix")))
 
-        names = [n for n, _, _ in self._upstreams]
+        names = [n for n, _, _, _ in self._upstreams]
         log.info(f"[upstream] loaded {len(self._upstreams)} upstreams: {names}, default={self._default}")
 
     def resolve(self, auth_header: str | None) -> ResolvedTarget | None:
@@ -65,7 +66,7 @@ class UpstreamRouter:
 
         key = self._extract_key(auth_header)
 
-        for name, target, prefixes in self._upstreams:
+        for name, target, prefixes, path_prefix in self._upstreams:
             for prefix in prefixes:
                 if key and key.startswith(prefix):
                     log.debug(f"[upstream] key={key[:12]}** → {name} (prefix \"{prefix}\")")
@@ -73,6 +74,7 @@ class UpstreamRouter:
                         target_url=target,
                         upstream_name=name,
                         matched_key_prefix=prefix,
+                        path_prefix=path_prefix,
                     )
 
         log.debug(f"[upstream] key={key[:12] if key else '<none>'}** → {self._default} (default)")
@@ -91,7 +93,7 @@ class UpstreamRouter:
         return auth_header
 
     def _resolve_default_target(self) -> str:
-        for name, target, _ in self._upstreams:
+        for name, target, _, _ in self._upstreams:
             if name == self._default:
                 return target
         return self._upstreams[0][1] if self._upstreams else ""

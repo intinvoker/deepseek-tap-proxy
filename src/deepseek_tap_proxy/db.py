@@ -39,6 +39,9 @@ class Database:
         create_openai_tables(conn)
         create_anthropic_tables(conn)
         conn.commit()
+        # Migrate existing DBs
+        from deepseek_tap_proxy.anthropic.db import migrate_add_system_role_converted
+        migrate_add_system_role_converted(conn)
 
     def close(self) -> None:
         if hasattr(self._local, "conn") and self._local.conn:

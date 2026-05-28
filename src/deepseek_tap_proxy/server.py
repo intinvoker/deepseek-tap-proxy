@@ -10,7 +10,7 @@ from aiohttp import web
 from deepseek_tap_proxy.config import ProxyConfig
 from deepseek_tap_proxy.db import Database
 from deepseek_tap_proxy.shared.trace import TraceWriter
-from deepseek_tap_proxy.shared.headers import HOP_BY_HOP
+from deepseek_tap_proxy.shared.headers import HOP_BY_HOP, filter_hop_by_hop
 from deepseek_tap_proxy.router import UpstreamRouter
 from deepseek_tap_proxy.openai.routes import setup_openai_routes
 from deepseek_tap_proxy.anthropic.routes import setup_anthropic_routes
@@ -64,7 +64,7 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
 
     app.on_shutdown.append(lambda _: asyncio.gather(
         _close_writer(writer), _close_session(client_session),
-        _wait_persists(app),
+        _close_db(db), _wait_persists(app),
         return_exceptions=True,
     ))
 
@@ -112,6 +112,7 @@ async def _proxy_get_handler(request: web.Request) -> web.Response:
 
     fwd_headers = dict(request.headers)
     fwd_headers.pop("Host", None)
+    fwd_headers = filter_hop_by_hop(fwd_headers)
     upstream_url = target.rstrip("/") + request.path
 
     try:
@@ -144,6 +145,10 @@ async def _close_writer(writer: TraceWriter) -> None:
 
 async def _close_session(session: aiohttp.ClientSession) -> None:
     await session.close()
+
+
+async def _close_db(db) -> None:
+    db.close()
 
 
 async def _wait_persists(app: web.Application) -> None:

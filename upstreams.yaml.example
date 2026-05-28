@@ -14,3 +14,9 @@ upstreams:
     target: https://token-plan-cn.xiaomimimo.com
     keys:
       - "tp-"
+
+  # custom:
+  #   target: http://localhost:43001
+  #   keys:
+  #     - "sk-custom-"
+  #   path_prefix: /v1/messages  # Override Anthropic upstream path (optional)

@@ -64,7 +64,7 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
         persists.add(t1)
         t1.add_done_callback(persists.discard)
     if db and writer:
-        t2 = asyncio.create_task(_persist_phase2(ctx, db, writer))
+        t2 = asyncio.create_task(_persist_phase2(ctx, db, writer, phase1_task=t1 if db else None))
         persists.add(t2)
         t2.add_done_callback(persists.discard)
 
@@ -158,9 +158,16 @@ async def _persist_phase1(ctx: Context, db) -> None:
         log.exception(f"[{ctx.req_id}] phase1 persist failed")
 
 
-async def _persist_phase2(ctx: Context, db, writer: TraceWriter) -> None:
-    """Phase 2: update response data, modification flag, and write JSONL."""
+async def _persist_phase2(ctx: Context, db, writer: TraceWriter, phase1_task: asyncio.Task | None = None) -> None:
+    """Phase 2: update response data, modification flag, and write JSONL.
+
+    Waits for phase1_task to complete first to avoid a race where the
+    UPDATE runs before the INSERT (silently affecting 0 rows), leaving
+    the record stuck in 'pending' state.
+    """
     try:
+        if phase1_task is not None:
+            await phase1_task
         record = _build_trace_record(ctx)
         jsonl_offset = await writer.write(record)
         ctx.meta["jsonl_offset"] = jsonl_offset

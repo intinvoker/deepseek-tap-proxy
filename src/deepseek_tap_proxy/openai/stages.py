@@ -18,7 +18,7 @@ from aiohttp import web
 
 from deepseek_tap_proxy.pipeline import Context, Stage
 from deepseek_tap_proxy.shared.decompress import decompress_body
-from deepseek_tap_proxy.shared.headers import HOP_BY_HOP
+from deepseek_tap_proxy.shared.headers import HOP_BY_HOP, filter_hop_by_hop
 from deepseek_tap_proxy.openai.db import (
     _resolve_session_fingerprint,
     get_previous_msg0,
@@ -140,6 +140,7 @@ class ParseStage(Stage):
 
         fwd_headers = dict(ctx.request.headers)
         fwd_headers.pop("Host", None)
+        fwd_headers = filter_hop_by_hop(fwd_headers)
 
         req_content_encoding = ctx.request.headers.get("Content-Encoding", "").lower()
         if req_content_encoding in ("zstd", "gzip", "deflate", "br"):

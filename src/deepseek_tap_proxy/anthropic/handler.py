@@ -10,7 +10,8 @@ from deepseek_tap_proxy.router import ResolvedTarget
 from deepseek_tap_proxy.anthropic.stages import (
     AnthropicParseStage, AnthropicNormalizeStage, AnthropicBlock0ClearStage,
     AnthropicCanonicalUserStage, AnthropicBaselineStage,
-    AnthropicForwardStage, ReturnStage,
+    AnthropicSystemRoleConvertStage,
+    AnthropicUpstreamPathStage, AnthropicForwardStage, ReturnStage,
 )
 
 log = logging.getLogger("deepseek-tap")
@@ -47,6 +48,8 @@ async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
         AnthropicBlock0ClearStage(),
         AnthropicCanonicalUserStage(),
         AnthropicBaselineStage(),
+        AnthropicSystemRoleConvertStage(),
+        AnthropicUpstreamPathStage(),
         AnthropicForwardStage(),
         ReturnStage(),
     ])

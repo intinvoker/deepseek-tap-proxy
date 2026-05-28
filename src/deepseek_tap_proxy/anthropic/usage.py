@@ -30,4 +30,9 @@ def normalize_anthropic_usage(usage: dict) -> dict:
 
     normalized.setdefault("cache_creation_input_tokens", 0)
 
+    if "cache_miss_input_tokens" not in normalized:
+        miss = usage.get("prompt_cache_miss_tokens")
+        if miss is not None:
+            normalized["cache_miss_input_tokens"] = miss
+
     return normalized

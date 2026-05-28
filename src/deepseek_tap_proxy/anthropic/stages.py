@@ -67,6 +67,7 @@ class AnthropicParseStage(Stage):
 
         fwd_headers = dict(ctx.request.headers)
         fwd_headers.pop("Host", None)
+        fwd_headers = filter_hop_by_hop(fwd_headers)
         if ctx.raw_body and ctx.req_body is not None:
             fwd_headers["Content-Length"] = str(len(ctx.raw_body))
         ctx.fwd_headers = fwd_headers
@@ -151,9 +152,9 @@ class AnthropicBlock0ClearStage(Stage):
 class AnthropicCanonicalUserStage(Stage):
     """Look up existing sys+tools hash baseline to reuse user_id for cross-session APC.
 
-    Reads system/tools from req_body (immutable), computes hashes, checks
-    DB for existing baseline with same hashes. If found and has a user_id,
-    overrides fwd_body metadata with the canonical user_id.
+    Uses fwd_body.system (post-Block0Clear, billing header already cleared)
+    for hash computation, so sys_hash is consistent across sessions with the
+    same core system prompt, enabling cross-session APC cache hits.
     """
 
     async def process(self, ctx: Context) -> Context:
@@ -163,7 +164,8 @@ class AnthropicCanonicalUserStage(Stage):
         if not sid:
             return ctx
 
-        system = ctx.req_body.get("system")
+        # Use fwd_body.system (post-Block0Clear) for consistent cross-session hash
+        system = ctx.fwd_body.get("system") if ctx.fwd_body is not None else ctx.req_body.get("system")
         tools = ctx.req_body.get("tools", [])
         has_sys = isinstance(system, list) and len(system) >= 1
         has_tools = isinstance(tools, list) and len(tools) > 0
@@ -239,7 +241,9 @@ class AnthropicBaselineStage(Stage):
         if conn is None:
             return ctx
 
-        system = ctx.req_body.get("system")
+        # Use fwd_body.system if available (post-Block0Clear, system[0].text already emptied)
+        # to avoid storing and later restoring the billing-header that breaks APC prefix.
+        system = ctx.fwd_body.get("system") if ctx.fwd_body is not None else ctx.req_body.get("system")
         tools = ctx.req_body.get("tools", [])
         tools_hash = ctx.meta.get("tools_hash", "")
         baseline = get_baseline(conn, sid)
@@ -289,16 +293,73 @@ class AnthropicBaselineStage(Stage):
         return ctx
 
 
-class AnthropicForwardStage(Stage):
-    async def process(self, ctx: Context) -> Context:
-        proxy_ctx = ctx.request.app.get("proxy_ctx", {})
-        upstream = ctx.request.get("upstream")
-        if upstream is None:
-            target = proxy_ctx.get("target_url", "")
-        else:
-            target = upstream.target_url
-        timeout = proxy_ctx.get("timeout", 600)
+class AnthropicSystemRoleConvertStage(Stage):
+    """Convert role=system messages to role=user for upstream compatibility.
 
+    Claude Code MCP mode may inject MCP server instructions as a message with
+    role='system' in the messages array. Some upstreams (e.g. Xiaomi Mimo)
+    reject role='system' in messages. This stage converts them to role='user'
+    and sets a flag for DB tracking.
+    """
+
+    async def process(self, ctx: Context) -> Context:
+        if not isinstance(ctx.req_body, dict):
+            return ctx
+        messages = ctx.req_body.get("messages", [])
+        if not isinstance(messages, list):
+            return ctx
+
+        converted = False
+        has_system_role = any(
+            isinstance(m, dict) and m.get("role") == "system"
+            for m in messages
+        )
+        if not has_system_role:
+            return ctx
+
+        # Build fwd_body if not already modified
+        body = ctx.fwd_body if ctx.fwd_body is not None else ctx.req_body
+        new_messages = []
+        for m in body.get("messages", []):
+            if isinstance(m, dict) and m.get("role") == "system":
+                m = dict(m)
+                m["role"] = "user"
+                converted = True
+            new_messages.append(m)
+
+        if converted:
+            fwd = copy.deepcopy(ctx.req_body)
+            fwd["messages"] = new_messages
+            ctx.fwd_body = fwd
+            ctx.meta["system_role_converted"] = True
+            log.info(
+                f"[{ctx.req_id}] converted role=system → role=user "
+                f"({sum(1 for m in new_messages if m.get('role')=='user')} user messages)"
+            )
+
+        return ctx
+
+
+class AnthropicUpstreamPathStage(Stage):
+    """Compute upstream URL based on upstream's path_prefix.
+
+    If the upstream has a `path_prefix` configured and the request is for
+    the Messages API (/v1/messages), the upstream URL is built as:
+
+        target + path_prefix
+
+    Otherwise falls back to the default behavior:
+
+        target + /anthropic + path
+
+    The result is stored in ctx.upstream_url for ForwardStage to consume.
+    """
+
+    _MESSAGES_PATH = "/v1/messages"
+
+    async def process(self, ctx: Context) -> Context:
+        upstream = ctx.request.get("upstream")
+        target = ctx.target_url
         if not target:
             ctx.should_abort = True
             ctx.response = web.Response(status=502, text="Upstream not configured")
@@ -307,48 +368,65 @@ class AnthropicForwardStage(Stage):
         req_path = ctx.request.path_qs
         if req_path.startswith("/anthropic"):
             req_path = req_path[len("/anthropic"):]
-        upstream_url = target.rstrip("/") + "/anthropic" + req_path
+        # Strip query string for path matching
+        clean_path = req_path.split("?", 1)[0].rstrip("/")
 
+        path_prefix = upstream.path_prefix if upstream else None
+
+        if path_prefix and clean_path == self._MESSAGES_PATH:
+            ctx.upstream_url = target.rstrip("/") + path_prefix
+            log.debug(
+                f"[{ctx.req_id}] upstream path override: "
+                f"{target} + {path_prefix} → {ctx.upstream_url}"
+            )
+        else:
+            ctx.upstream_url = target.rstrip("/") + "/anthropic" + req_path
+
+        return ctx
+
+
+class AnthropicForwardStage(Stage):
+    async def process(self, ctx: Context) -> Context:
+        timeout = ctx.request.app.get("proxy_ctx", {}).get("timeout", 600)
+
+        target = ctx.target_url
+        if not target:
+            ctx.should_abort = True
+            ctx.response = web.Response(status=502, text="Upstream not configured")
+            return ctx
+
+        upstream_url = ctx.upstream_url
+        if not upstream_url:
+            # Fallback: build URL the old way (shouldn't happen with UpstreamPathStage in place)
+            req_path = ctx.request.path_qs
+            if req_path.startswith("/anthropic"):
+                req_path = req_path[len("/anthropic"):]
+            upstream_url = target.rstrip("/") + "/anthropic" + req_path
+
+        upstream = ctx.request.get("upstream")
         if upstream is not None:
             ctx.meta["upstream_name"] = upstream.upstream_name
 
-        max_attempts = 2
-        upstream_resp = None
-        fresh_session = None
-        last_exc = None
+        # fwd_body carries stage modifications (normalized user_id, block0 clear, etc.)
+        if ctx.fwd_body is not None:
+            body_bytes = json.dumps(
+                ctx.fwd_body, ensure_ascii=False
+            ).encode("utf-8")
+        else:
+            body_bytes = ctx.raw_body or None
+        if body_bytes is not None:
+            ctx.fwd_headers["Content-Length"] = str(len(body_bytes))
 
-        for attempt in range(1, max_attempts + 1):
-            try:
-                fresh_session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=timeout, sock_read=timeout),
-                )
-                # fwd_body carries stage modifications (normalized user_id, block0 clear, etc.)
-                if ctx.fwd_body is not None:
-                    body_bytes = json.dumps(
-                        ctx.fwd_body, ensure_ascii=False
-                    ).encode("utf-8")
-                else:
-                    body_bytes = ctx.raw_body or None
-                if body_bytes is not None:
-                    ctx.fwd_headers["Content-Length"] = str(len(body_bytes))
-                upstream_resp = await fresh_session.request(
-                    method=ctx.request.method, url=upstream_url,
-                    headers=ctx.fwd_headers, data=body_bytes,
-                )
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                if fresh_session:
-                    await fresh_session.close()
-                    fresh_session = None
-                if attempt < max_attempts:
-                    await asyncio.sleep(0.5)
-
-        if last_exc is not None:
-            log.error(f"[{ctx.req_id}] ← 502 upstream error after {max_attempts} attempts: {last_exc}")
+        try:
+            upstream_resp = await session.request(
+                method=ctx.request.method, url=upstream_url,
+                headers=ctx.fwd_headers, data=body_bytes,
+                timeout=aiohttp.ClientTimeout(total=timeout, sock_read=timeout),
+            )
+        except Exception as exc:
+            log.error(f"[{ctx.req_id}] upstream error: {exc}")
             ctx.should_abort = True
-            ctx.response = web.Response(status=502, text=str(last_exc))
+            ctx.response = web.Response(status=502, text=str(exc))
             return ctx
 
         ctx.status = upstream_resp.status
@@ -358,9 +436,6 @@ class AnthropicForwardStage(Stage):
             await self._relay_stream(ctx, upstream_resp)
         else:
             await self._relay_non_stream(ctx, upstream_resp)
-
-        if fresh_session:
-            await fresh_session.close()
 
         ctx.duration_ms = ctx.elapsed_ms
         usage = ctx.meta.get("usage", {})

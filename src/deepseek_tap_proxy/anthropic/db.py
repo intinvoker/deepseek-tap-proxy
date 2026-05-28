@@ -23,13 +23,17 @@ def create_anthropic_tables(conn: sqlite3.Connection) -> None:
             cache_hit_ratio REAL DEFAULT 0.0,
             cache_creation_tokens INTEGER DEFAULT 0,
             session_uuid TEXT DEFAULT NULL,
+            session_type TEXT DEFAULT NULL,
             jsonl_path TEXT NOT NULL DEFAULT '',
             api_format TEXT DEFAULT 'anthropic',
             turn INTEGER DEFAULT 0,
             record_state TEXT DEFAULT 'completed',
             is_modified INTEGER DEFAULT 0,
             lock_type TEXT DEFAULT NULL,
-            modification_note TEXT DEFAULT NULL
+            modification_note TEXT DEFAULT NULL,
+            trace_category TEXT DEFAULT NULL,
+            jsonl_offset INTEGER DEFAULT 0,
+            system_role_converted INTEGER DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_requests_format ON requests(api_format);
@@ -67,6 +71,23 @@ def create_anthropic_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_request_audit_session
             ON request_audit(session_id);
     """)
+    # Migration: add session_type column if missing
+    try:
+        conn.execute("ALTER TABLE requests ADD COLUMN session_type TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # Already exists
+
+    # Migration: add trace_category column if missing
+    try:
+        conn.execute("ALTER TABLE requests ADD COLUMN trace_category TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # Already exists
+
+    # Migration: add jsonl_offset column if missing
+    try:
+        conn.execute("ALTER TABLE requests ADD COLUMN jsonl_offset INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Already exists
 
 
 def insert_anthropic_trace(
@@ -78,7 +99,6 @@ def insert_anthropic_trace(
     status_code: int,
     stream_mode: bool,
     jsonl_path: str,
-    turn: int,
     session_id: str | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
@@ -91,63 +111,57 @@ def insert_anthropic_trace(
             (request_id, timestamp, duration_ms, model, stream_mode, status_code,
              prompt_tokens, completion_tokens, cache_hit_tokens,
              cache_creation_tokens,
-             session_uuid, jsonl_path, api_format, turn, record_state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'anthropic', ?, 'completed')
+             session_uuid, jsonl_path, api_format, record_state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'anthropic', 'completed')
     """, (
         req_id, timestamp, duration_ms, model,
         1 if stream_mode else 0, status_code,
         input_tokens, output_tokens, cache_read_tokens,
         cache_creation_tokens,
-        session_id, jsonl_path, turn,
+        session_id, jsonl_path,
     ))
     conn.commit()
 
 
-def get_previous_anthropic_turn(
-    conn: sqlite3.Connection,
-    session_uuid: str,
-    current_turn: int,
-) -> dict | None:
-    """Get the previous turn's DB record for diff."""
-    row = conn.execute("""
-        SELECT request_id, jsonl_path FROM requests
-        WHERE api_format = 'anthropic' AND session_uuid = ? AND turn = ?
-        LIMIT 1
-    """, (session_uuid, current_turn - 1)).fetchone()
-    return dict(row) if row else None
+
 
 
 def insert_phase1(conn: sqlite3.Connection, *, req_id: str, timestamp: str,
                   model: str, stream_mode: bool, jsonl_path: str,
-                  turn: int = 0, session_id: str | None = None) -> None:
+                  session_id: str | None = None,
+                  trace_category: str | None = None) -> None:
     """Phase 1: insert with 'recording' state."""
     conn.execute("""
         INSERT OR IGNORE INTO requests
             (request_id, timestamp, duration_ms, model, stream_mode, status_code,
-             session_uuid, jsonl_path, api_format, turn, record_state)
-        VALUES (?, ?, 0, ?, ?, 0, ?, ?, 'anthropic', ?, 'recording')
+             session_uuid, trace_category, jsonl_path, api_format, record_state)
+        VALUES (?, ?, 0, ?, ?, 0, ?, ?, ?, 'anthropic', 'recording')
     """, (req_id, timestamp, model, 1 if stream_mode else 0,
-          session_id, jsonl_path, turn))
+          session_id, trace_category, jsonl_path))
     conn.commit()
 
 
 def update_phase2(conn: sqlite3.Connection, *, req_id: str, duration_ms: int,
                   status_code: int, input_tokens: int = 0, output_tokens: int = 0,
                   cache_hit_tokens: int = 0, cache_creation_tokens: int = 0,
-                  jsonl_path: str | None = None) -> None:
+                  jsonl_path: str | None = None,
+                  jsonl_offset: int = 0) -> None:
     """Phase 2: fill response data, set 'completed'."""
     total = input_tokens + output_tokens
-    cache_miss = cache_creation_tokens
-    total_cache = cache_hit_tokens + cache_creation_tokens
+    # cache_miss_tokens: tokens not served from cache = new input tokens
+    # (DeepSeek's input_tokens excludes cached tokens)
+    cache_miss = input_tokens
+    total_cache = cache_hit_tokens + cache_miss
     ratio = round(cache_hit_tokens / total_cache, 4) if total_cache > 0 else 0.0
     sets = """
         duration_ms = ?, status_code = ?,
         prompt_tokens = ?, completion_tokens = ?, total_tokens = ?,
         cache_hit_tokens = ?, cache_miss_tokens = ?, cache_hit_ratio = ?,
+        jsonl_offset = ?,
         record_state = 'completed'
     """
     params = [duration_ms, status_code, input_tokens, output_tokens,
-              total, cache_hit_tokens, cache_miss, ratio]
+              total, cache_hit_tokens, cache_miss, ratio, jsonl_offset]
     if jsonl_path:
         sets += ", jsonl_path = ?"
         params.append(jsonl_path)
@@ -161,10 +175,29 @@ def update_modification_flag(conn: sqlite3.Connection, *, req_id: str,
                               lock_info: str | None = None,
                               modification_note: str | None = None) -> None:
     """Set modification flags after persist."""
-    conn.execute("""
+    conn.execute("""\
         UPDATE requests SET is_modified = ?, lock_type = ?, modification_note = ?
         WHERE request_id = ?
     """, (1 if is_modified else 0, lock_info or "", modification_note or "", req_id))
+    conn.commit()
+
+
+def migrate_add_system_role_converted(conn: sqlite3.Connection) -> None:
+    """Add system_role_converted column if missing (for existing DBs)."""
+    try:
+        conn.execute("ALTER TABLE requests ADD COLUMN system_role_converted INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+
+def update_system_role_converted(conn: sqlite3.Connection, *, req_id: str,
+                                  converted: bool = True) -> None:
+    """Mark a request as having had role=system converted to role=user."""
+    conn.execute(
+        "UPDATE requests SET system_role_converted = ? WHERE request_id = ?",
+        (1 if converted else 0, req_id)
+    )
     conn.commit()
 
 

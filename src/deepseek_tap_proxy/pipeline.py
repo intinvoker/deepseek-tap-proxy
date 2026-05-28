@@ -29,6 +29,7 @@ class Context:
     req_id: str = ""
 
     target_url: str = ""
+    upstream_url: str = ""  # Final upstream URL (set by UpstreamPathStage)
     is_streaming: bool = False
     timeout: int = 600
 
