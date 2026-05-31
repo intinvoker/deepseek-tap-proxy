@@ -387,7 +387,9 @@ class AnthropicUpstreamPathStage(Stage):
 
 class AnthropicForwardStage(Stage):
     async def process(self, ctx: Context) -> Context:
-        timeout = ctx.request.app.get("proxy_ctx", {}).get("timeout", 600)
+        proxy_ctx = ctx.request.app.get("proxy_ctx", {})
+        session: aiohttp.ClientSession = proxy_ctx.get("session")
+        timeout = proxy_ctx.get("timeout", 600)
 
         target = ctx.target_url
         if not target:

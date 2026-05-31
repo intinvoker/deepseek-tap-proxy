@@ -25,7 +25,7 @@ classifiers = [
 Repository = "https://github.com/intinvoker/deepseek-tap-proxy"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "pytest-cov", "pytest-timeout"]
 
 [project.scripts]
 deepseek-tap-proxy = "deepseek_tap_proxy.__main__:main"
