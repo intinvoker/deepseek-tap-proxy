@@ -1,0 +1,1 @@
+"""Copilot-specific optimization stages."""
