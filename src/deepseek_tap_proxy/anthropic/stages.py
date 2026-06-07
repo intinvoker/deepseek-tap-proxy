@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
-import re
+
+from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
@@ -17,13 +17,8 @@ from deepseek_tap_proxy.shared.decompress import decompress_body
 from deepseek_tap_proxy.shared.headers import filter_hop_by_hop
 from deepseek_tap_proxy.anthropic.sse import AnthropicReconstructor
 from deepseek_tap_proxy.anthropic.usage import normalize_anthropic_usage
-from deepseek_tap_proxy.anthropic.db import (
-    find_baseline_by_hashes, get_baseline, create_baseline, insert_audit,
-)
 
 log = logging.getLogger("deepseek-tap")
-
-_ANTHROPIC_USER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 _ALLOWED_PATH_PREFIXES = ("/v1/messages", "/v1/complete", "/v1/models")
 
@@ -48,7 +43,6 @@ class AnthropicParseStage(Stage):
             return ctx
 
         raw_body = await ctx.request.read() if ctx.request.method in ("POST", "PUT", "PATCH") else b""
-        ctx.raw_body = raw_body
 
         encoding = ctx.request.headers.get("Content-Encoding", "").lower()
         if encoding in ("zstd", "gzip", "deflate", "br"):
@@ -60,16 +54,20 @@ class AnthropicParseStage(Stage):
         if raw_body:
             try:
                 parsed = json.loads(raw_body)
-                ctx.req_body = parsed
-                ctx.is_streaming = parsed.get("stream", False)
+                ctx.body_readonly = parsed
+                if isinstance(parsed, dict):
+                    ctx.fwd_body = copy.deepcopy(parsed)
+                else:
+                    ctx.fwd_body = parsed
+                # ── 规范形式 view 就绪 ──
+                ctx.format = "anthropic"
+                ctx.is_streaming = parsed.get("stream", False) if isinstance(parsed, dict) else False
             except (json.JSONDecodeError, ValueError):
                 pass
 
         fwd_headers = dict(ctx.request.headers)
         fwd_headers.pop("Host", None)
         fwd_headers = filter_hop_by_hop(fwd_headers)
-        if ctx.raw_body and ctx.req_body is not None:
-            fwd_headers["Content-Length"] = str(len(ctx.raw_body))
         ctx.fwd_headers = fwd_headers
 
         proxy_ctx = ctx.request.app.get("proxy_ctx", {})
@@ -77,60 +75,52 @@ class AnthropicParseStage(Stage):
             ctx.target_url = proxy_ctx.get("target_url", "")
         ctx.timeout = proxy_ctx.get("timeout", 600)
 
-        # Extract Claude-Code session ID for persist and baseline
+        # Extract Claude-Code session ID for persist
         sid = ctx.request.headers.get("X-Claude-Code-Session-Id", "") or \
               ctx.request.headers.get("x-claude-code-session-id", "")
         ctx.meta["anthropic_sid"] = sid
+
+        # Session detection via shared/analysis.py
+        from deepseek_tap_proxy.shared.analysis import resolve_session_anthropic
+        system = (ctx.body_readonly or {}).get("system", [])
+        db = ctx.request.app.get("db")
+        session = resolve_session_anthropic(system, dict(ctx.request.headers), db=db)
+        ctx.meta["session"] = session
 
         # Upstream base URL for persist (only set if handler didn't already)
         if "upstream_base_url" not in ctx.meta:
             ctx.meta["upstream_base_url"] = proxy_ctx.get("target_url", "")
 
-        model = (ctx.req_body or {}).get("model", "?")
-        log.info(
-            f"[{ctx.req_id}] → {ctx.request.method} {ctx.request.path} "
-            f"(model={model}, stream={ctx.is_streaming})"
-        )
+        # strip metadata.user_id if configured
+        config = ctx.request.app.get("config", {})
+        if getattr(config, "strip_user_id", True):
+            meta = ctx.fwd_body.get("metadata") if isinstance(ctx.fwd_body, dict) else None
+            if isinstance(meta, dict):
+                meta.pop("user_id", None)
+
+        # ── persist fields ──
+        from deepseek_tap_proxy.anthropic.persist import _detect_title_gen
+        ctx.persist.trace_category = _detect_title_gen(ctx.body_readonly) or ""
+        ctx.persist.api_format = "anthropic"
+        ctx.persist.model = (ctx.body_readonly or {}).get("model", "")
+        ctx.persist.stream_mode = ctx.is_streaming
+        ctx.persist.request_id = ctx.req_id
+        ctx.persist.timestamp = datetime.now(timezone.utc).isoformat()
+
         return ctx
 
-
-class AnthropicNormalizeStage(Stage):
-    """Hash non-standard user_id for DeepSeek compatibility.
-
-    Reads original metadata from req_body (immutable), writes normalized
-    user_id to fwd_body (mutable). Archives original metadata in meta.
-    """
-
-    async def process(self, ctx: Context) -> Context:
-        if not isinstance(ctx.req_body, dict):
-            return ctx
-        metadata = ctx.req_body.get("metadata")
-        if not isinstance(metadata, dict):
-            return ctx
-        user_id = metadata.get("user_id")
-        if not isinstance(user_id, str) or _ANTHROPIC_USER_ID_RE.fullmatch(user_id):
-            return ctx
-
-        digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]
-        ctx.meta["original_metadata"] = dict(metadata)
-        if ctx.fwd_body is None:
-            ctx.fwd_body = copy.deepcopy(ctx.req_body)
-        new_meta = dict(ctx.fwd_body.get("metadata", {}))
-        new_meta["user_id"] = f"tap_{digest}"
-        ctx.fwd_body["metadata"] = new_meta
-        return ctx
 
 
 class AnthropicBlock0ClearStage(Stage):
     """Clear first system block text for cache stability.
 
-    Reads original system from req_body, empties block[0].text in fwd_body.
+    Reads original system from body_readonly, empties block[0].text in fwd_body.
     """
 
     async def process(self, ctx: Context) -> Context:
-        if not isinstance(ctx.req_body, dict):
+        if not isinstance(ctx.body_readonly, dict):
             return ctx
-        system = ctx.req_body.get("system")
+        system = ctx.body_readonly.get("system")
         if not isinstance(system, list) or not system:
             return ctx
         block0 = system[0]
@@ -140,201 +130,43 @@ class AnthropicBlock0ClearStage(Stage):
             return ctx
 
         if ctx.fwd_body is None:
-            ctx.fwd_body = copy.deepcopy(ctx.req_body)
+            ctx.fwd_body = copy.deepcopy(ctx.body_readonly)
         fwd_system = list(ctx.fwd_body.get("system", system))
         fwd_system[0] = dict(fwd_system[0])
         fwd_system[0]["text"] = ""
         ctx.fwd_body["system"] = fwd_system
-        ctx.meta["modified"] = True
+        ctx.persist.is_modified = True
         return ctx
 
 
-class AnthropicCanonicalUserStage(Stage):
-    """Look up existing sys+tools hash baseline to reuse user_id for cross-session APC.
-
-    Uses fwd_body.system (post-Block0Clear, billing header already cleared)
-    for hash computation, so sys_hash is consistent across sessions with the
-    same core system prompt, enabling cross-session APC cache hits.
-    """
-
-    async def process(self, ctx: Context) -> Context:
-        if not isinstance(ctx.req_body, dict):
-            return ctx
-        sid = ctx.meta.get("anthropic_sid", "")
-        if not sid:
-            return ctx
-
-        # Use fwd_body.system (post-Block0Clear) for consistent cross-session hash
-        system = ctx.fwd_body.get("system") if ctx.fwd_body is not None else ctx.req_body.get("system")
-        tools = ctx.req_body.get("tools", [])
-        has_sys = isinstance(system, list) and len(system) >= 1
-        has_tools = isinstance(tools, list) and len(tools) > 0
-        if not has_sys or not has_tools:
-            return ctx
-
-        sys_hash = hashlib.sha256(
-            json.dumps(system, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        tools_hash = hashlib.sha256(
-            json.dumps(tools, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        ctx.meta["sys_hash"] = sys_hash
-        ctx.meta["tools_hash"] = tools_hash
-
-        conn = ctx.request.app.get("db_conn")
-        if conn is None:
-            return ctx
-
-        # Determine current user_id (from original_metadata or req_body)
-        raw_meta = ctx.meta.get("original_metadata") or ctx.req_body.get("metadata") or {}
-        raw_uid = raw_meta.get("user_id", "") or ""
-        if raw_uid:
-            if _ANTHROPIC_USER_ID_RE.fullmatch(raw_uid):
-                current_uid = raw_uid
-            else:
-                digest = hashlib.sha256(raw_uid.encode("utf-8")).hexdigest()[:24]
-                current_uid = f"tap_{digest}"
-        else:
-            current_uid = ""
-
-        # Look for existing baseline with same sys+tools hash
-        existing = find_baseline_by_hashes(conn, sys_hash, tools_hash)
-
-        if existing:
-            canonical = existing["user_id"]
-            if canonical:
-                if canonical != current_uid:
-                    if ctx.fwd_body is None:
-                        ctx.fwd_body = copy.deepcopy(ctx.req_body)
-                    new_meta = dict(ctx.fwd_body.get("metadata", {}))
-                    new_meta["user_id"] = canonical
-                    ctx.fwd_body["metadata"] = new_meta
-                    ctx.meta["user_id"] = canonical
-                    ctx.meta["user_id_was_overridden"] = True
-                else:
-                    ctx.meta["user_id"] = canonical or current_uid
-            else:
-                ctx.meta["user_id"] = current_uid
-        else:
-            ctx.meta["user_id"] = current_uid
-
-        return ctx
-
-
-class AnthropicBaselineStage(Stage):
-    """Sys/tools baseline: capture on first request, compare+replace on subsequent.
-
-    On first request in session: saves system+tools JSON + hashes to DB.
-    On subsequent requests: compares current hashes vs baseline.
-    If sys or tools changed, replaces fwd_body with baseline values.
-    """
-
-    async def process(self, ctx: Context) -> Context:
-        if not isinstance(ctx.req_body, dict):
-            return ctx
-        sid = ctx.meta.get("anthropic_sid", "")
-        sys_hash = ctx.meta.get("sys_hash", "")
-        if not sid or not sys_hash:
-            return ctx
-
-        conn = ctx.request.app.get("db_conn")
-        if conn is None:
-            return ctx
-
-        # Use fwd_body.system if available (post-Block0Clear, system[0].text already emptied)
-        # to avoid storing and later restoring the billing-header that breaks APC prefix.
-        system = ctx.fwd_body.get("system") if ctx.fwd_body is not None else ctx.req_body.get("system")
-        tools = ctx.req_body.get("tools", [])
-        tools_hash = ctx.meta.get("tools_hash", "")
-        baseline = get_baseline(conn, sid)
-
-        if baseline is None:
-            # First request: create baseline with canonical user_id
-            sys_ser = json.dumps(system, separators=(",", ":"), ensure_ascii=False)
-            tools_ser = json.dumps(tools, separators=(",", ":"), ensure_ascii=False)
-            canonical_uid = ctx.meta.get("user_id", "")
-            create_baseline(conn,
-                            session_id=sid, system_json=sys_ser, tools_json=tools_ser,
-                            request_id=ctx.req_id, system_hash=sys_hash,
-                            tools_hash=tools_hash, user_id=canonical_uid)
-            ctx.meta["is_baseline_set"] = True
-            insert_audit(conn,
-                         request_id=ctx.req_id, session_id=sid,
-                         system_hash=sys_hash, tools_hash=tools_hash,
-                         is_baseline=True, sys_changed=False, tools_changed=False,
-                         was_replaced=False,
-                         user_id_was_overridden=ctx.meta.get("user_id_was_overridden", False),
-                         metadata=ctx.meta.get("original_metadata"))
-        else:
-            # Subsequent request: compare hashes
-            ctx.meta["is_baseline_set"] = False
-            sys_changed = sys_hash != baseline["system_hash"]
-            tools_changed = tools_hash != baseline["tools_hash"]
-            replaced = sys_changed or tools_changed
-
-            if replaced:
-                if ctx.fwd_body is None:
-                    ctx.fwd_body = copy.deepcopy(ctx.req_body)
-                if sys_changed:
-                    ctx.fwd_body["system"] = json.loads(baseline["system_json"])
-                if tools_changed:
-                    ctx.fwd_body["tools"] = json.loads(baseline["tools_json"])
-                ctx.meta["modified"] = True
-
-            insert_audit(conn,
-                         request_id=ctx.req_id, session_id=sid,
-                         system_hash=sys_hash, tools_hash=tools_hash,
-                         is_baseline=False,
-                         sys_changed=sys_changed, tools_changed=tools_changed,
-                         was_replaced=replaced,
-                         user_id_was_overridden=ctx.meta.get("user_id_was_overridden", False),
-                         metadata=ctx.meta.get("original_metadata"))
-
-        return ctx
 
 
 class AnthropicSystemRoleConvertStage(Stage):
     """Convert role=system messages to role=user for upstream compatibility.
 
-    Claude Code MCP mode may inject MCP server instructions as a message with
-    role='system' in the messages array. Some upstreams (e.g. Xiaomi Mimo)
-    reject role='system' in messages. This stage converts them to role='user'
-    and sets a flag for DB tracking.
+    Operates on ctx.messages view — no direct fwd_body access.
     """
 
     async def process(self, ctx: Context) -> Context:
-        if not isinstance(ctx.req_body, dict):
-            return ctx
-        messages = ctx.req_body.get("messages", [])
-        if not isinstance(messages, list):
+        if not ctx.messages:
             return ctx
 
         converted = False
-        has_system_role = any(
-            isinstance(m, dict) and m.get("role") == "system"
-            for m in messages
-        )
-        if not has_system_role:
-            return ctx
-
-        # Build fwd_body if not already modified
-        body = ctx.fwd_body if ctx.fwd_body is not None else ctx.req_body
-        new_messages = []
-        for m in body.get("messages", []):
-            if isinstance(m, dict) and m.get("role") == "system":
+        new_msgs = []
+        for m in ctx.messages:  # 通过 view 读取
+            if m.get("role") == "system":
                 m = dict(m)
                 m["role"] = "user"
                 converted = True
-            new_messages.append(m)
+            new_msgs.append(m)
 
         if converted:
-            fwd = copy.deepcopy(ctx.req_body)
-            fwd["messages"] = new_messages
-            ctx.fwd_body = fwd
-            ctx.meta["system_role_converted"] = True
+            ctx.messages = new_msgs  # 通过 view 写回
+            ctx.persist.system_role_converted = True
+            ctx.persist.is_modified = True
             log.info(
                 f"[{ctx.req_id}] converted role=system → role=user "
-                f"({sum(1 for m in new_messages if m.get('role')=='user')} user messages)"
+                f"({sum(1 for m in new_msgs if m.get('role')=='user')} user messages)"
             )
 
         return ctx
@@ -415,9 +247,12 @@ class AnthropicForwardStage(Stage):
                 ctx.fwd_body, ensure_ascii=False
             ).encode("utf-8")
         else:
-            body_bytes = ctx.raw_body or None
+            body_bytes = None
         if body_bytes is not None:
             ctx.fwd_headers["Content-Length"] = str(len(body_bytes))
+        else:
+            # 防止残留原始 Content-Length 导致上游空等 body
+            ctx.fwd_headers.pop("Content-Length", None)
 
         try:
             upstream_resp = await session.request(
@@ -426,6 +261,10 @@ class AnthropicForwardStage(Stage):
                 timeout=aiohttp.ClientTimeout(total=timeout, sock_read=timeout),
             )
         except Exception as exc:
+            ctx.status = 502
+            ctx.duration_ms = ctx.elapsed_ms
+            from deepseek_tap_proxy.shared.stages import emit_request_log
+            emit_request_log(ctx)
             log.error(f"[{ctx.req_id}] upstream error: {exc}")
             ctx.should_abort = True
             ctx.response = web.Response(status=502, text=str(exc))
@@ -440,14 +279,9 @@ class AnthropicForwardStage(Stage):
             await self._relay_non_stream(ctx, upstream_resp)
 
         ctx.duration_ms = ctx.elapsed_ms
-        usage = ctx.meta.get("usage", {})
-        log.info(
-            f"[{ctx.req_id}] ← {ctx.status} {ctx.duration_ms}ms"
-            + (f" in={usage.get('input_tokens', 0)}"
-               f" out={usage.get('output_tokens', 0)}"
-               f" cache_r={usage.get('cache_read_input_tokens', 0)}"
-               if usage else "")
-        )
+        from deepseek_tap_proxy.shared.stages import apply_cache_analysis, emit_request_log
+        apply_cache_analysis(ctx)
+        emit_request_log(ctx)
         return ctx
 
     async def _relay_stream(self, ctx: Context, upstream_resp) -> None:

@@ -46,11 +46,11 @@ class TraceWriter:
         model = req_body.get("model", "unknown") if isinstance(req_body, dict) else "unknown"
         self.models_used[model] = self.models_used.get(model, 0) + 1
 
-        cache_analysis = record.get("cache_analysis", {})
-        self.total_input_tokens += cache_analysis.get("prompt_total_tokens", 0)
-        self.total_output_tokens += cache_analysis.get("output_tokens", 0)
-        self.total_cache_read_tokens += cache_analysis.get("cache_hit_tokens", 0)
-        self.total_cache_miss_tokens += cache_analysis.get("cache_miss_tokens", 0)
+        usage = record.get("usage", {})
+        self.total_input_tokens += usage.get("total_input_tokens", 0)
+        self.total_output_tokens += usage.get("output_tokens", 0)
+        self.total_cache_read_tokens += usage.get("cache_hit_tokens", 0)
+        self.total_cache_miss_tokens += usage.get("cache_miss_tokens", 0)
 
     def get_summary(self) -> dict:
         return {
@@ -63,3 +63,47 @@ class TraceWriter:
             "session_id": self.session_id,
             "trace_file": str(self.path),
         }
+
+
+def build_trace_record(ctx) -> dict:
+    """Build a unified trace record for JSONL output.
+
+    Raw request/response from Context directly (not from persist).
+    Usage/meta from ctx.persist (same source as DB).
+    """
+    from deepseek_tap_proxy.shared.headers import redact
+    from datetime import datetime, timezone
+
+    r = ctx.persist
+    return {
+        "request_id": r.request_id or ctx.req_id,
+        "timestamp": r.timestamp or datetime.now(timezone.utc).isoformat(),
+        "duration_ms": ctx.duration_ms or ctx.elapsed_ms or 0,
+        "upstream_base_url": ctx.target_url,
+        "upstream_name": ctx.meta.get("upstream_name", "default"),
+        "api_format": r.api_format,
+        "request": {
+            "method": "POST",
+            "path": ctx.request.path,
+            "headers": redact(dict(ctx.request.headers)),
+            "body": ctx.body_readonly,
+        },
+        "response": {
+            "status": ctx.status,
+            "headers": redact(ctx.resp_headers),
+            "body": ctx.resp_body,
+        },
+        "usage": {
+            "request_id": r.request_id,
+            "total_input_tokens": r.total_input_tokens,
+            "output_tokens": r.output_tokens,
+            "total_tokens": r.total_input_tokens + r.output_tokens,
+            "cache_hit_tokens": r.cache_hit_tokens,
+            "cache_miss_tokens": r.cache_miss_tokens,
+            "cache_hit_ratio": r.cache_hit_ratio,
+            "has_reasoning": r.has_reasoning,
+            "has_tool_calls": r.has_tool_calls,
+            "prompt_messages_count": r.prompt_messages_count,
+            "prompt_tools_count": r.prompt_tools_count,
+        },
+    }
