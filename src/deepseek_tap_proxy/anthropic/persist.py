@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime, timezone
 
 from deepseek_tap_proxy.pipeline import Context
-from deepseek_tap_proxy.shared.headers import redact
+from deepseek_tap_proxy.shared.trace import build_trace_record
 
 log = logging.getLogger("deepseek-tap")
 
@@ -57,85 +57,45 @@ def _detect_title_gen(req_body: dict | None) -> str | None:
     return "auto_title"
 
 
-def _db_insert_phase1(db, **kwargs) -> None:
-    """Thread-safe phase1 insert: resolves db.conn inside target thread."""
-    from deepseek_tap_proxy.anthropic.db import insert_phase1
+def _db_insert_phase1(db, ctx, session=None) -> None:
+    """Thread-safe phase1 insert via shared unified function."""
+    from deepseek_tap_proxy.shared.db import insert_request_phase1
     conn = db.conn
-    insert_phase1(conn, **kwargs)
+    insert_request_phase1(conn, ctx, session=session)
 
 
-def _db_update_phase2(db, **kwargs) -> None:
-    """Thread-safe phase2 update: resolves db.conn inside target thread."""
-    from deepseek_tap_proxy.anthropic.db import update_phase2
+def _db_update_phase2(db, ctx, jsonl_path: str = '') -> None:
+    """Thread-safe phase2 update via shared unified function."""
+    from deepseek_tap_proxy.shared.db import update_request_phase2
     conn = db.conn
-    update_phase2(conn, **kwargs)
-
-
-def _db_update_modification_flag(db, **kwargs) -> None:
-    """Thread-safe modification flag update: resolves db.conn inside target thread."""
-    from deepseek_tap_proxy.anthropic.db import update_modification_flag
-    conn = db.conn
-    update_modification_flag(conn, **kwargs)
-
-
-def _db_update_system_role_converted(db, **kwargs) -> None:
-    """Thread-safe system_role_converted flag update."""
-    from deepseek_tap_proxy.anthropic.db import update_system_role_converted
-    conn = db.conn
-    update_system_role_converted(conn, **kwargs)
+    update_request_phase2(conn, ctx, jsonl_path=jsonl_path)
 
 
 async def persist_anthropic(ctx: Context, db, writer) -> None:
     """Fire-and-forget: phase1 -> JSONL -> phase2 -> modification flag."""
-    if writer is None or ctx.req_body is None:
+    if writer is None or ctx.body_readonly is None:
         return
 
     usage = ctx.meta.get("usage", {})
     sid = ctx.meta.get("anthropic_sid", "")
-    model = (ctx.req_body or {}).get("model", "")
-    trace_category = _detect_title_gen(ctx.req_body)
+    model = (ctx.body_readonly or {}).get("model", "")
+    trace_category = _detect_title_gen(ctx.body_readonly)
+    session = ctx.meta.get("session")
 
-    # Phase 1: recording
+    # Phase 1: recording (use shared unified function)
     if db is not None:
         try:
+            ctx.persist.trace_category = trace_category or ""
+            ctx.persist.api_format = "anthropic"
             await asyncio.to_thread(
-                _db_insert_phase1, db,
-                req_id=ctx.req_id,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                model=model,
-                stream_mode=ctx.is_streaming,
-                jsonl_path=str(writer.path),
-                session_id=sid or None,
-                trace_category=trace_category,
+                _db_insert_phase1, db, ctx, session=session,
             )
         except Exception:
             log.exception("[%s] phase1 insert failed", ctx.req_id)
 
-    # JSONL: use fwd_body when modified (stages like Normalize/Block0Clear/Baseline
-    # write to fwd_body; req_body is the original). When unmodified, req_body = fwd_body.
-    trace_body = ctx.fwd_body if ctx.fwd_body is not None else ctx.req_body
+    # JSONL: unified builder
     try:
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "request_id": ctx.req_id,
-            "duration_ms": ctx.duration_ms or 0,
-            "upstream_base_url": ctx.meta.get("upstream_base_url", ""),
-            "upstream_name": ctx.meta.get("upstream_name", "default"),
-            "api_format": "anthropic",
-            "request": {
-                "method": "POST",
-                "path": ctx.request.path,
-                "headers": redact(dict(ctx.request.headers)),
-                "body": trace_body,
-            },
-            "response": {
-                "status": ctx.status,
-                "headers": redact(ctx.resp_headers),
-                "body": ctx.resp_body,
-            },
-        }
-        if usage:
-            record["usage"] = usage
+        record = build_trace_record(ctx)
         if "sse_events" in ctx.meta:
             record["response"]["sse_events"] = ctx.meta["sse_events"]
         offset = await writer.write(record)
@@ -143,43 +103,13 @@ async def persist_anthropic(ctx: Context, db, writer) -> None:
         log.exception("[%s] JSONL write failed", ctx.req_id)
         offset = 0
 
-    # Phase 2: completed
+    # Phase 2: completed (use shared unified function)
     if db is not None:
         try:
+            ctx.meta["jsonl_offset"] = offset
             await asyncio.to_thread(
-                _db_update_phase2, db,
-                req_id=ctx.req_id,
-                duration_ms=ctx.duration_ms or 0,
-                status_code=ctx.status,
-                input_tokens=usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0) or usage.get("completion_tokens", 0),
-                cache_hit_tokens=usage.get("cache_read_input_tokens", 0),
-                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
-                jsonl_path=str(writer.path),
-                jsonl_offset=offset,
+                _db_update_phase2, db, ctx, jsonl_path=str(writer.path),
             )
         except Exception:
             log.exception("[%s] phase2 update failed", ctx.req_id)
 
-        # Modification flag
-        if ctx.meta.get("modified"):
-            try:
-                await asyncio.to_thread(
-                    _db_update_modification_flag, db,
-                    req_id=ctx.req_id,
-                    is_modified=True,
-                    modification_note="body modified",
-                )
-            except Exception:
-                log.exception("[%s] modification flag update failed", ctx.req_id)
-
-        # System role conversion flag
-        if ctx.meta.get("system_role_converted"):
-            try:
-                await asyncio.to_thread(
-                    _db_update_system_role_converted, db,
-                    req_id=ctx.req_id,
-                    converted=True,
-                )
-            except Exception:
-                log.exception("[%s] system_role_converted flag update failed", ctx.req_id)

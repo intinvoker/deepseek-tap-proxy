@@ -62,13 +62,18 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     if add_health:
         app.router.add_get("/health", _health_handler)
 
-    app.on_shutdown.append(lambda _: asyncio.gather(
-        _close_writer(writer), _close_session(client_session),
-        _close_db(db), _wait_persists(app),
-        return_exceptions=True,
-    ))
+    async def _shutdown(app: web.Application) -> None:
+        """Ordered shutdown: wait for persists, then close resources."""
+        proxy_ctx = app.get("proxy_ctx", {})
+        persists: set[asyncio.Task] = proxy_ctx.get("_pending_persists", set())
+        if persists:
+            await asyncio.gather(*persists, return_exceptions=True)
+        await _close_writer(writer)
+        await _close_session(client_session)
+        await _close_db(db)
 
-    log.info(f"Proxy session: {session_id}")
+    app.on_shutdown.append(_shutdown)
+
     log.info(f"Trace file: {writer.path}")
     log.info(f"Database: {config.db_path}")
     log.info(f"Listening on {config.host}:{config.port}")
