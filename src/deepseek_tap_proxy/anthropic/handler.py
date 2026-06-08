@@ -5,7 +5,7 @@ import asyncio
 import logging
 from aiohttp import web
 
-from deepseek_tap_proxy.pipeline import Context, Pipeline
+from deepseek_tap_proxy.pipeline import Context, Stage
 from deepseek_tap_proxy.router import ResolvedTarget
 from deepseek_tap_proxy.shared.stages import (
     CanonicalStage, SysToolsLockStage, RequestClassifierStage,
@@ -17,6 +17,42 @@ from deepseek_tap_proxy.anthropic.stages import (
 )
 
 log = logging.getLogger("deepseek-tap")
+
+
+# ── Pipeline 定义 ──────────────────────────────────────────────────────────
+
+FULL_ANTHROPIC: list[type[Stage]] = [
+    AnthropicParseStage,
+    AnthropicBlock0ClearStage,
+    CanonicalStage,
+    RequestClassifierStage,
+    SysToolsLockStage,
+    AnthropicSystemRoleConvertStage,
+    AnthropicUpstreamPathStage,
+    AnthropicForwardStage,
+    ReturnStage,
+]
+
+ANTHROPIC_SKIP_TABLE: dict[str, set[type[Stage]]] = {
+    "claude-code": {RequestClassifierStage},
+    "generic":     {RequestClassifierStage},
+}
+
+
+def _detect_client_type(request: web.Request) -> str:
+    """从 headers 预检测 client_type，无需解析 body。"""
+    beta = request.headers.get("anthropic-beta", "")
+    if "claude-code" in beta:
+        return "claude-code"
+    return "generic"
+
+
+def setup_anthropic_pipelines(app: web.Application) -> None:
+    """启动时构建所有 Anthropic pipeline variant。由 server.py 调用。"""
+    from deepseek_tap_proxy.pipeline import PipelineFactory
+    factory = PipelineFactory()
+    factory.build_all(FULL_ANTHROPIC, ANTHROPIC_SKIP_TABLE)
+    app["anthropic_pipeline"] = factory
 
 
 def _persist_chain_nowait(ctx, db) -> None:
@@ -71,20 +107,8 @@ async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
     ctx.target_url = resolved.target_url
     ctx.meta["upstream_base_url"] = resolved.target_url
 
-    config = request.app.get("config", {})
-    lock_sys_tools = getattr(config, "lock_sys_tools", True)
-
-    pipeline = Pipeline([
-        AnthropicParseStage(),
-        AnthropicBlock0ClearStage(),
-        CanonicalStage(),
-        RequestClassifierStage(),
-        SysToolsLockStage(enabled=lock_sys_tools),
-        AnthropicSystemRoleConvertStage(),
-        AnthropicUpstreamPathStage(),
-        AnthropicForwardStage(),
-        ReturnStage(),
-    ])
+    client_type = _detect_client_type(request)
+    pipeline = request.app["anthropic_pipeline"].get(client_type)
     ctx = await pipeline.execute(ctx)
 
     # ── 前缀链优先持久化：管道结束后立即写入，确保下一条请求能命中 ──

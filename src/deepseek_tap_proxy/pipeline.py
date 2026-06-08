@@ -274,8 +274,17 @@ class Stage(ABC):
 class Pipeline:
     """Ordered sequence of stages through which a request flows."""
 
-    def __init__(self, stages: list[Stage]) -> None:
-        self.stages = stages
+    def __init__(self, stages: list[type[Stage]] | list[Stage],
+                 skip_set: set[type[Stage]] | None = None) -> None:
+        skip = skip_set or set()
+        built: list[Stage] = []
+        for s in stages:
+            if isinstance(s, type):
+                if s not in skip:
+                    built.append(s())
+            else:
+                built.append(s)
+        self.stages = built
 
     async def execute(self, ctx: Context) -> Context:
         for stage in self.stages:
@@ -283,3 +292,35 @@ class Pipeline:
             if ctx.should_abort:
                 break
         return ctx
+
+
+class PipelineFactory:
+    """启动时构建所有 pipeline variant，请求时按 client_type 查表即用。
+
+    Usage:
+        factory = PipelineFactory()
+        factory.build_all(FULL_STAGES, {"copilot": {SkipA}, "generic": {SkipA, SkipB}})
+        pipeline = factory.get("copilot")   # → 命中 copilot
+        pipeline = factory.get("unknown")   # → 回退 generic
+    """
+
+    def __init__(self):
+        self._pipelines: dict[str, Pipeline] = {}
+
+    def build_all(self, full: list[type[Stage]],
+                  skip_table: dict[str, set[type[Stage]]]) -> None:
+        """用一份 FULL 清单 + 跳过表构造所有 variant。"""
+        for client_type, skip_set in skip_table.items():
+            self._pipelines[client_type] = Pipeline(full, skip_set=skip_set)
+
+    def get(self, client_type: str) -> Pipeline:
+        """按 client_type 返回对应的 Pipeline，未知类型回退到 generic。"""
+        p = self._pipelines.get(client_type)
+        if p is not None:
+            return p
+        # 回退 generic
+        p = self._pipelines.get("generic")
+        if p is not None:
+            return p
+        # 最后一个回退：用 full 列表无跳过构造一个
+        raise RuntimeError("PipelineFactory: no 'generic' variant configured")

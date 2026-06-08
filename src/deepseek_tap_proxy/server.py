@@ -48,6 +48,8 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     app["writer"] = writer
 
     setup_openai_routes(app)
+    from deepseek_tap_proxy.anthropic.handler import setup_anthropic_pipelines
+    setup_anthropic_pipelines(app)
     setup_anthropic_routes(app)
 
     # Wrap GET handlers with upstream resolution

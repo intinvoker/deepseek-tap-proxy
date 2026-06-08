@@ -379,13 +379,20 @@ class SysToolsLockStage(Stage):
     - ``init``: first time canonical is captured
     - ``lock``: locked (restored from canonical) because current != canonical
     - ``pass``: already matches canonical, no action
+
+    ``lock_sys_tools`` 配置从 ``ctx.request.app["config"]`` 读取，
+    不依赖构造参数（使得 PipelineFactory 预构造不会丢失配置）。
     """
 
     def __init__(self, enabled: bool = True) -> None:
-        self.enabled = enabled
+        # enabled 参数保留向后兼容，但实际值从运行时配置读取
+        self._default_enabled = enabled
 
     async def process(self, ctx: Context) -> Context:
-        if not self.enabled:
+        # 运行时读取配置，优先级高于构造参数
+        config = ctx.request.app.get("config", {})
+        lock_enabled = getattr(config, "lock_sys_tools", self._default_enabled)
+        if not lock_enabled:
             return ctx
 
         # RequestClassifierStage 设此标记时跳过（如 Copilot 子代理请求）
@@ -518,6 +525,9 @@ class RequestClassifierStage(Stage):
     """
 
     async def process(self, ctx: Context) -> Context:
+        # 执行标记：用于测试验证 pipeline 是否包含此 stage
+        ctx.meta["classifier_executed"] = True
+
         session = ctx.meta.get("session")
         if not session:
             return ctx
