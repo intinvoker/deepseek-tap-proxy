@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
 
@@ -56,7 +55,7 @@ class AnthropicParseStage(Stage):
                 parsed = json.loads(raw_body)
                 ctx.body_readonly = parsed
                 if isinstance(parsed, dict):
-                    ctx.fwd_body = copy.deepcopy(parsed)
+                    ctx.fwd_body = dict(parsed)  # 浅拷贝比 deepcopy 快 N 倍
                 else:
                     ctx.fwd_body = parsed
                 # ── 规范形式 view 就绪 ──
@@ -129,8 +128,8 @@ class AnthropicBlock0ClearStage(Stage):
         if not block0["text"]:
             return ctx
 
-        if ctx.fwd_body is None:
-            ctx.fwd_body = copy.deepcopy(ctx.body_readonly)
+        if ctx.fwd_body is None and ctx.body_readonly is not None:
+            ctx.fwd_body = dict(ctx.body_readonly)  # 浅拷贝
         fwd_system = list(ctx.fwd_body.get("system", system))
         fwd_system[0] = dict(fwd_system[0])
         fwd_system[0]["text"] = ""

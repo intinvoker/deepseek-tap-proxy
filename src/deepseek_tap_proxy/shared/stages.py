@@ -41,6 +41,9 @@ class PrefixLockStage(Stage):
     async def process(self, ctx: Context) -> Context:
         if not self.enabled:
             return ctx
+
+        # 确保 hash chain 已计算（可能被 CanonicalStage 延迟了）
+        _ensure_msg_hash_chain(ctx)
         if not ctx.persist.msg_hash_chain:
             return ctx
 
@@ -325,6 +328,16 @@ class PrefixLockStage(Stage):
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════
 
+def _ensure_msg_hash_chain(ctx) -> str:
+    """Ensure msg_hash_chain is computed (lazy). 返回 hash_chain 字符串。"""
+    if not ctx.persist.msg_hash_chain:
+        from deepseek_tap_proxy.shared.hash import compute_canonical_hash_chain
+        ctx.persist.msg_hash_chain = compute_canonical_hash_chain(
+            ctx.sys, ctx.tools, ctx.messages,
+        )
+    return ctx.persist.msg_hash_chain
+
+
 def _compute_char_count(messages: list[dict]) -> int:
     """Compute total serialized character count for token estimation.
 
@@ -388,68 +401,94 @@ class SysToolsLockStage(Stage):
         if not db:
             return ctx
 
-        from deepseek_tap_proxy.shared.db import (
-            get_session_canonical, set_session_canonical,
-        )
+        def _sync_canonical(database, sk, cur_sys, cur_tools):
+            """单次 to_thread 内完成查+写。
 
-        canon = await asyncio.to_thread(
-            lambda: get_session_canonical(db.conn, session.key)
-        )
+            接收 Database 实例而非 conn，因为 SQLite connection 绑创建线程。
+            在 thread pool worker 内访问 db.conn 可自动创建新连接。
 
-        cur_sys_json = json.dumps(ctx.sys, separators=(",", ":"), ensure_ascii=False)
-        cur_tools_json = json.dumps(ctx.tools, separators=(",", ":"), ensure_ascii=False)
-
-        has_canon_sys = bool(canon.get("sys"))
-        has_canon_tools = bool(canon.get("tools"))
-
-        # No canonical data yet → populate from current request
-        if not has_canon_sys and not has_canon_tools:
-            # Nothing to lock and nothing to store → skip
-            if not ctx.sys and not ctx.tools:
-                return ctx
-            # Store whatever we have
-            new_sys = cur_sys_json if ctx.sys else ""
-            new_tools = cur_tools_json if ctx.tools else ""
-            await asyncio.to_thread(
-                lambda: set_session_canonical(
-                    db.conn, session.key,
-                    sys=new_sys, tools=new_tools,
-                )
+            返回 (action, restored_sys, restored_tools)：
+            - "none": 无内容，什么都不做
+            - "init": 首次写入 canonical
+            - "lock": 需要恢复（cur_sys != canon_sys 等），restored_* 为基线值
+            - "pass": 已匹配，无需操作
+            """
+            conn = database.conn  # 在 thread pool 内获取连接
+            from deepseek_tap_proxy.shared.db import (
+                get_session_canonical, set_session_canonical,
             )
+            cur_sys_json = json.dumps(cur_sys, separators=(",", ":"), ensure_ascii=False)
+            cur_tools_json = json.dumps(cur_tools, separators=(",", ":"), ensure_ascii=False)
+
+            canon = get_session_canonical(conn, sk)
+            has_canon_sys = bool(canon.get("sys"))
+            has_canon_tools = bool(canon.get("tools"))
+
+            # 无基线 → 首次写入
+            if not has_canon_sys and not has_canon_tools:
+                if not cur_sys and not cur_tools:
+                    return ("none", [], [])
+                new_sys = cur_sys_json if cur_sys else ""
+                new_tools = cur_tools_json if cur_tools else ""
+                set_session_canonical(conn, sk, sys=new_sys, tools=new_tools)
+                return ("init", [], [])
+
+            # 有基线 → 比较
+            restored_sys = list(cur_sys)
+            restored_tools = list(cur_tools)
+            needs_lock = False
+
+            if has_canon_sys:
+                canon_sys = json.loads(canon["sys"])
+                if cur_sys != canon_sys:
+                    restored_sys = canon_sys
+                    needs_lock = True
+
+            if has_canon_tools:
+                canon_tools = json.loads(canon["tools"])
+                if cur_tools != canon_tools:
+                    restored_tools = canon_tools
+                    needs_lock = True
+
+            if needs_lock:
+                return ("lock", restored_sys, restored_tools)
+            return ("pass", [], [])
+
+        # 传 db 而非 db.conn：SQLite connection 绑创建线程，
+        # _sync_canonical 内部在 thread pool 中访问 db.conn 自动创建新连接
+        action, restored_sys, restored_tools = await asyncio.to_thread(
+            _sync_canonical, db, session.key,
+            ctx.sys, ctx.tools,
+        )
+
+        if action == "init":
             ctx.meta["sys_tools_locked"] = "init"
             return ctx
-
-        # Canonical exists → compare and lock if needed
-        needs_lock = False
-
-        if has_canon_sys:
-            canon_sys = json.loads(canon["sys"])
-            if ctx.sys != canon_sys:
-                ctx.sys = canon_sys
-                needs_lock = True
-
-        if has_canon_tools:
-            canon_tools = json.loads(canon["tools"])
-            if ctx.tools != canon_tools:
-                ctx.tools = canon_tools
-                needs_lock = True
-
-        if needs_lock:
-            ctx.meta["sys_tools_locked"] = "lock"
-            ctx.persist.is_modified = True
-            ctx.persist.modification_note = "sys_tools_locked"
-            # 重新计算 hash_chain：CanonicalStage 在 SysToolsLock 之前算过一遍，
-            # 但锁定后的 sys/tools 可能变了，hash 必须反映恢复后的真实内容。
-            from deepseek_tap_proxy.shared.hash import compute_canonical_hash_chain
-            ctx.persist.msg_hash_chain = compute_canonical_hash_chain(
-                ctx.sys, ctx.tools, ctx.messages,
-            )
-            # 同时修正三段长度（用于 pref(stm)= 显示）
-            ctx.meta["orig_sys_len"] = len(ctx.sys)
-            ctx.meta["orig_tools_len"] = len(ctx.tools)
-            ctx.meta["orig_msgs_len"] = len(ctx.messages)
-        else:
+        if action == "none":
+            return ctx
+        if action == "pass":
             ctx.meta["sys_tools_locked"] = "pass"
+            return ctx
+
+        # action == "lock" — 恢复 sys/tools
+        if restored_sys:
+            ctx.sys = restored_sys
+        if restored_tools:
+            ctx.tools = restored_tools
+
+        ctx.meta["sys_tools_locked"] = "lock"
+        ctx.persist.is_modified = True
+        ctx.persist.modification_note = "sys_tools_locked"
+
+        # 重新计算 hash_chain（sys/tools 已变）
+        from deepseek_tap_proxy.shared.hash import compute_canonical_hash_chain
+        ctx.persist.msg_hash_chain = compute_canonical_hash_chain(
+            ctx.sys, ctx.tools, ctx.messages,
+        )
+        # 修正三段长度
+        ctx.meta["orig_sys_len"] = len(ctx.sys)
+        ctx.meta["orig_tools_len"] = len(ctx.tools)
+        ctx.meta["orig_msgs_len"] = len(ctx.messages)
 
         return ctx
 
@@ -610,11 +649,8 @@ class CanonicalStage(Stage):
         ctx.meta["orig_tools_len"] = tools_count
         ctx.meta["orig_msgs_len"] = msgs_len
 
-        # hash chain
-        from deepseek_tap_proxy.shared.hash import compute_canonical_hash_chain
-        ctx.persist.msg_hash_chain = compute_canonical_hash_chain(
-            ctx.sys, ctx.tools, ctx.messages,
-        )
+        # hash chain — 延迟计算，不在热路径做遍历 hash
+        # 各消费方（PrefixLock、persist、log）按需调用 _ensure_msg_hash_chain()
 
         # 扩展 view：同名映射 from fwd_body
         for name in self.extensions:
