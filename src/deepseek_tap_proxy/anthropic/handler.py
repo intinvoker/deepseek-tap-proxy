@@ -5,7 +5,7 @@ import asyncio
 import logging
 from aiohttp import web
 
-from deepseek_tap_proxy.pipeline import Context, Stage
+from deepseek_tap_proxy.pipeline import Context, Pipeline, Stage
 from deepseek_tap_proxy.router import ResolvedTarget
 from deepseek_tap_proxy.shared.stages import (
     CanonicalStage, SysToolsLockStage, RequestClassifierStage,
@@ -108,7 +108,13 @@ async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
     ctx.meta["upstream_base_url"] = resolved.target_url
 
     client_type = _detect_client_type(request)
-    pipeline = request.app["anthropic_pipeline"].get(client_type)
+    factory = request.app.get("anthropic_pipeline")
+    if factory is not None:
+        pipeline = factory.get(client_type)
+    else:
+        # Fallback for tests without setup_anthropic_pipelines
+        skip_set = ANTHROPIC_SKIP_TABLE.get(client_type, set())
+        pipeline = Pipeline(FULL_ANTHROPIC, skip_set=skip_set)
     ctx = await pipeline.execute(ctx)
 
     # ── 前缀链优先持久化：管道结束后立即写入，确保下一条请求能命中 ──
