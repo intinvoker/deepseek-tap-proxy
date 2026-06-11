@@ -1,83 +1,51 @@
-"""Pipeline infrastructure — format-agnostic execution engine.
+"""Context — 请求/响应数据载体，在 pipeline stages 之间流转。
 
-Context carries request/response data through stages. The canonical form
-(``sys`` / ``tools`` / ``messages``) provides a format-agnostic view
-backed by ``fwd_body``.  Property accessors transparently map reads and
-writes to the appropriate API-specific fields::
+Canonical form（格式无关视图）::
 
-    Format       sys location          messages location
-    ──────       ────────────          ─────────────────
-    openai        messages[0]           messages[1:]
-    anthropic     system field          messages[]
+    ctx.sys       — system prompt messages
+    ctx.tools     — tool definitions
+    ctx.messages  — conversation messages (user/assistant/tool)
 
-All pipeline stages operate on the canonical form — they don't need to
-know whether the request arrived as OpenAI or Anthropic format.
+这些是 *properties*，底层由 ``fwd_body`` 支持。读取时从 API 特定结构提取，
+写入时透明映射回去。Pipeline stages 操作这些属性，而不是直接接触 ``fwd_body``。
 """
-
 from __future__ import annotations
 
 import copy
 import time
 import uuid
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+import xxhash
 from aiohttp import web
 from typing import Optional
 
 from deepseek_tap_proxy.shared.persist import PersistRecord
-
-
-@dataclass
-class ChainAction:
-    """PrefixLock 的链操作决策——persist 只读此对象，不做独立决策。"""
-    action: str                           # "create" | "update" | "none"
-    chain_id: str | None = None
-    msg_count: int = 0
-    hash_chain: str = ""
-    sys: list[dict] | None = None
-    tools: list[dict] | None = None
-    messages: list[dict] | None = None
-    safe_breakpoints: list[int] | None = None
-    hit_count: int = 0
-    chain_tokens: int | None = None
-    char_count: int = 0                   # canonical 消息的字符总数
-    is_frozen: bool = False               # 公共前缀链（冻结，不 UPDATE）
-
+from deepseek_tap_proxy.shared.hash import msg_hash
+from deepseek_tap_proxy.pipeline.chain_action import ChainAction
+from deepseek_tap_proxy.pipeline.snapshot import SysToolsSnapshot
 
 REQUEST_ID_LENGTH = 12
 
 
 @dataclass
 class Context:
-    """Request/response carrier that flows through pipeline stages.
-
-    Canonical form (format-agnostic view)::
-
-        ctx.sys       — system prompt messages
-        ctx.tools     — tool definitions
-        ctx.messages  — conversation messages (user / assistant / tool)
-
-    These are *properties* backed by ``fwd_body``.  Reading from them
-    extracts from the API-specific structure; writing to them maps back
-    transparently.  Pipeline stages operate on these, never on
-    ``fwd_body`` directly.
-    """
+    """请求/响应载体，流经 pipeline 各 stage。"""
 
     request: web.Request
-    body_readonly: dict | None = None  # 只读：ParseStage 设置后永不修改。如需修改说明你写错了地方。
+    body_readonly: dict | None = None   # 只读：ParseStage 设置后永不修改
     fwd_body: dict | None = None
     fwd_headers: dict = field(default_factory=dict)
     req_id: str = ""
-    format: str = ""  # "openai" | "anthropic" — set by ParseStage
+    format: str = ""                    # "openai" | "anthropic"
 
     target_url: str = ""
-    upstream_url: str = ""  # Final upstream URL (set by UpstreamPathStage)
+    upstream_url: str = ""
     is_streaming: bool = False
     timeout: int = 600
 
     status: int = 0
-    resp_body: dict | None = None  # 原始响应体（格式相关），由 ForwardStage 设置
+    resp_body: dict | None = None
     resp_bytes: bytes = b""
     resp_headers: dict = field(default_factory=dict)
 
@@ -88,9 +56,32 @@ class Context:
     _t0: float = 0.0
 
     meta: dict = field(default_factory=dict)
-    chain_action: Optional['ChainAction'] = None  # PrefixLock 产出，persist 消费
-    ext: dict = field(default_factory=dict)  # 扩展 view（同名映射 from fwd_body）
+    chain_action: Optional['ChainAction'] = None
+    sys_tools_snap: SysToolsSnapshot = field(default_factory=SysToolsSnapshot)
+    ext: dict = field(default_factory=dict)
     persist: PersistRecord = field(default_factory=PersistRecord)
+
+    # ── 请求身份（RequestAnalysisStage 设置）──
+    client_type: str = ""
+    chat_type: str = ""
+    session_id: str = ""
+    session_method: str = ""
+
+    # ── 规范形式分段长度（view setter 自动刷新）──
+    orig_sys_len: int = 0
+    orig_tools_len: int = 0
+    orig_msgs_len: int = 0
+
+    # ── 三段 hash（原生 list[str]，view setter 自动刷新）──
+    _sys_hashes: list[str] = field(default_factory=list)
+    _tools_hashes: list[str] = field(default_factory=list)
+    _messages_hashes: list[str] = field(default_factory=list)
+
+    # ── 分支族标识（sys_hashes + tools_hashes → streaming xxh3_64）──
+    family_key: str = ""
+
+    # ── 内部：是否已激活 view ──
+    _view_activated: bool = False
 
     def __post_init__(self) -> None:
         self._t0 = time.monotonic()
@@ -104,17 +95,12 @@ class Context:
 
     # ═══════════════════════════════════════════════════════════════
     #  Canonical form: sys / tools / messages
-    #
-    #  These properties are the *only* way pipeline stages should
-    #  access message content.  They transparently map to the
-    #  API-specific fwd_body structure.
     # ═══════════════════════════════════════════════════════════════
 
     # -- sys --------------------------------------------------------
 
     @property
     def sys(self) -> list[dict]:
-        """System prompt — format-agnostic canonical view."""
         if not self.fwd_body:
             return []
         if self.format == "openai":
@@ -153,33 +139,30 @@ class Context:
         elif self.format == "anthropic":
             if not value:
                 self.fwd_body.pop("system", None)
-            elif len(value) == 1:
-                # Single system message → store as string (simple case)
-                self.fwd_body["system"] = value[0].get("content", "")
             else:
-                # Multiple system blocks → store as list of text blocks
                 self.fwd_body["system"] = [
                     {"type": "text", "text": m.get("content", "")}
                     for m in value
                 ]
+        self._on_sys_changed()
 
     # -- tools ------------------------------------------------------
 
     @property
     def tools(self) -> list[dict]:
-        """Tool definitions — format-agnostic canonical view."""
-        return (self.fwd_body or {}).get("tools", []) or []
+        raw = (self.fwd_body or {}).get("tools", []) or []
+        return list(raw)
 
     @tools.setter
     def tools(self, value: list[dict]):
         if self.fwd_body is not None:
             self.fwd_body["tools"] = value
+        self._on_tools_changed()
 
     # -- messages ---------------------------------------------------
 
     @property
     def messages(self) -> list[dict]:
-        """Conversation messages (user/assistant/tool) — WITHOUT sys."""
         if not self.fwd_body:
             return []
         if self.format == "openai":
@@ -188,7 +171,7 @@ class Context:
                 return msgs[1:]
             return list(msgs)
         elif self.format == "anthropic":
-            return self.fwd_body.get("messages", [])
+            return list(self.fwd_body.get("messages", []))
         return []
 
     @messages.setter
@@ -203,29 +186,88 @@ class Context:
                 self.fwd_body["messages"] = list(value)
         elif self.format == "anthropic":
             self.fwd_body["messages"] = list(value)
+        self._on_messages_changed()
+
+    # -- hash: list[str] (原生) + chain str (派生，DB/JSONL 用) --------
+
+    @property
+    def sys_hashes(self) -> list[str]:
+        return self._sys_hashes
+
+    @property
+    def tools_hashes(self) -> list[str]:
+        return self._tools_hashes
+
+    @property
+    def messages_hashes(self) -> list[str]:
+        return self._messages_hashes
+
+    @property
+    def sys_hash_chain(self) -> str:
+        return ",".join(self._sys_hashes) if self._sys_hashes else ""
+
+    @property
+    def tools_hash_chain(self) -> str:
+        return ",".join(self._tools_hashes) if self._tools_hashes else ""
+
+    @property
+    def messages_hash_chain(self) -> str:
+        return ",".join(self._messages_hashes) if self._messages_hashes else ""
+
+    @property
+    def msg_hash_chain(self) -> str:
+        return ",".join(
+            p for p in [self.sys_hash_chain, self.tools_hash_chain, self.messages_hash_chain] if p
+        )
+
+    # -- 内部：view → hash/count 自动刷新 -----------------------------
+
+    def _on_sys_changed(self):
+        s = self.sys
+        self.orig_sys_len = len(s)
+        self._sys_hashes = [msg_hash(m) for m in s]
+        self._recompute_family_key()
+
+    def _on_tools_changed(self):
+        t = self.tools
+        self.orig_tools_len = len(t)
+        self._tools_hashes = [msg_hash(m) for m in t]
+        self._recompute_family_key()
+
+    def _on_messages_changed(self):
+        m = self.messages
+        self.orig_msgs_len = len(m)
+        self._messages_hashes = [msg_hash(m) for m in m]
+
+    def _recompute_family_key(self):
+        """Streaming xxh3_64 over sys_hashes + tools_hashes → 16-char hex."""
+        h = xxhash.xxh3_64()
+        for s in self._sys_hashes:
+            h.update(s.encode())
+        for t in self._tools_hashes:
+            h.update(t.encode())
+        self.family_key = h.hexdigest()[:16] if (self._sys_hashes or self._tools_hashes) else ""
+
+    def _activate_view(self):
+        """首次激活 canonical view：计算全部 hash/count + family_key。"""
+        self._on_sys_changed()
+        self._on_tools_changed()
+        self._on_messages_changed()
+        self._view_activated = True
 
     # ═══════════════════════════════════════════════════════════════
-    #  Response canonical view: format-agnostic response properties
-    #
-    #  Read-only views over ``resp_body`` — the raw upstream response.
-    #  Pipeline stages should use these instead of digging into
-    #  format-specific response structures.
+    #  Response canonical view
     # ═══════════════════════════════════════════════════════════════
 
     @property
     def resp_usage(self) -> dict:
-        """归一化 usage：{input_tokens, output_tokens, cache_read_input_tokens, ...}"""
         if not self.resp_body:
             return {}
         from deepseek_tap_proxy.shared.usage import normalize_usage
-        return normalize_usage(
-            self.resp_body.get("usage", {}),
-            self.format,
-        )
+        return normalize_usage(self.resp_body.get("usage", {}), self.format)
 
     @property
     def resp_model(self) -> str:
-        """模型名（来自响应体，回退到请求体）。"""
         if self.resp_body:
             m = self.resp_body.get("model")
             if m:
@@ -234,7 +276,6 @@ class Context:
 
     @property
     def resp_has_tool_calls(self) -> bool:
-        """响应中是否有 tool_calls（OpenAI）或 tool_use（Anthropic）。"""
         if not self.resp_body:
             return False
         if self.format == "openai":
@@ -249,7 +290,6 @@ class Context:
 
     @property
     def resp_has_reasoning(self) -> bool:
-        """响应中是否有 reasoning_content / thinking 内容。"""
         if not self.resp_body:
             return False
         if self.format == "openai":
@@ -261,66 +301,3 @@ class Context:
             content = self.resp_body.get("content", [])
             return any(c.get("type") == "thinking" for c in content)
         return False
-
-
-class Stage(ABC):
-    """Single processing step in the pipeline."""
-
-    @abstractmethod
-    async def process(self, ctx: Context) -> Context:
-        ...
-
-
-class Pipeline:
-    """Ordered sequence of stages through which a request flows."""
-
-    def __init__(self, stages: list[type[Stage]] | list[Stage],
-                 skip_set: set[type[Stage]] | None = None) -> None:
-        skip = skip_set or set()
-        built: list[Stage] = []
-        for s in stages:
-            if isinstance(s, type):
-                if s not in skip:
-                    built.append(s())
-            else:
-                built.append(s)
-        self.stages = built
-
-    async def execute(self, ctx: Context) -> Context:
-        for stage in self.stages:
-            ctx = await stage.process(ctx)
-            if ctx.should_abort:
-                break
-        return ctx
-
-
-class PipelineFactory:
-    """启动时构建所有 pipeline variant，请求时按 client_type 查表即用。
-
-    Usage:
-        factory = PipelineFactory()
-        factory.build_all(FULL_STAGES, {"copilot": {SkipA}, "generic": {SkipA, SkipB}})
-        pipeline = factory.get("copilot")   # → 命中 copilot
-        pipeline = factory.get("unknown")   # → 回退 generic
-    """
-
-    def __init__(self):
-        self._pipelines: dict[str, Pipeline] = {}
-
-    def build_all(self, full: list[type[Stage]],
-                  skip_table: dict[str, set[type[Stage]]]) -> None:
-        """用一份 FULL 清单 + 跳过表构造所有 variant。"""
-        for client_type, skip_set in skip_table.items():
-            self._pipelines[client_type] = Pipeline(full, skip_set=skip_set)
-
-    def get(self, client_type: str) -> Pipeline:
-        """按 client_type 返回对应的 Pipeline，未知类型回退到 generic。"""
-        p = self._pipelines.get(client_type)
-        if p is not None:
-            return p
-        # 回退 generic
-        p = self._pipelines.get("generic")
-        if p is not None:
-            return p
-        # 最后一个回退：用 full 列表无跳过构造一个
-        raise RuntimeError("PipelineFactory: no 'generic' variant configured")

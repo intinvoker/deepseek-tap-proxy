@@ -12,8 +12,7 @@ class Session:
     """
     key: str
     client_type: str
-    fingerprint: str = ""
-    method: str = ""  # 'uuid' | 'match' | 'create'
+    fingerprint: str = ""  # defaults to empty for backward compat
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Session):
@@ -22,14 +21,3 @@ class Session:
 
     def __hash__(self) -> int:
         return hash(self.key)
-
-
-def split_session_fields(session: Session) -> tuple[str, str]:
-    """Return (session_id, session_fingerprint).
-
-    session_id: the session identifier (UUID, header ID, or fingerprint fallback).
-    session_fingerprint: content-based hash (always set).
-    """
-    key = session.key
-    fp = session.fingerprint or key
-    return (key, fp)

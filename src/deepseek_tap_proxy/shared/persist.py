@@ -35,8 +35,9 @@ class PersistRecord:
 
     # ── 会话 ──
     session_id: str = ""
-    session_type: str = ""         # match | uuid | create
-    session_fingerprint: str = ""
+    session_method: str = ""     # uuid | match | create — 解析方式
+    client_type: str = ""        # copilot | copilot-agent | hermes | claude-code | generic
+    chat_type: str = ""          # normal | compaction | subagent
 
     # ── 请求元数据 ──
     prompt_messages_count: int = 0

@@ -2,31 +2,53 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
+from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
 
 from deepseek_tap_proxy.config import ProxyConfig
 from deepseek_tap_proxy.db import Database
-from deepseek_tap_proxy.shared.trace import TraceWriter
 from deepseek_tap_proxy.shared.headers import HOP_BY_HOP, filter_hop_by_hop
+from deepseek_tap_proxy.shared.log import OtlpLogWriter, TraceWriter
+from deepseek_tap_proxy.shared.store import MemoryStore
 from deepseek_tap_proxy.router import UpstreamRouter
 from deepseek_tap_proxy.openai.routes import setup_openai_routes
 from deepseek_tap_proxy.anthropic.routes import setup_anthropic_routes
 
-SESSION_ID_LENGTH = 12
-
 log = logging.getLogger("deepseek-tap")
 
 
-async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> web.Application:
-    app = web.Application(client_max_size=10 * 1024**2)
+def _create_run_dir(trace_dir: str) -> tuple[str, str]:
+    """创建 run 目录，返回 (run_id, run_dir_path).
 
-    session_id = f"run_{uuid.uuid4().hex[:SESSION_ID_LENGTH]}"
-    writer = TraceWriter(config.trace_dir, session_id)
+    结构: {trace_dir}/{run_id}/
+    run_id = HHMMSS_random8
+
+    注：内层日期目录在写入第一条记录时动态创建，不在启动时预创建。
+    """
+    now = datetime.now(timezone.utc)
+    time_str = now.strftime("%H%M%S")
+    random_str = uuid.uuid4().hex[:8]
+    run_id = f"{time_str}_{random_str}"
+    run_dir = os.path.join(trace_dir, run_id)
+    os.makedirs(run_dir, exist_ok=False)
+    return run_id, run_dir
+
+
+async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> web.Application:
+    app = web.Application(client_max_size=64 * 1024**2)
+
+    run_id, run_dir = _create_run_dir(config.trace_dir)
+    writer = TraceWriter(run_dir, run_id)
     db = Database(config.db_path)
     db.init_db()
+
+    # MemoryStore: load existing data from SQLite into in-memory store (0 I/O runtime)
+    store = await MemoryStore.load_from(db, _db=db)
+
     client_session = aiohttp.ClientSession(
         headers={"User-Agent": "DeepSeekTap/0.1"},
     )
@@ -34,14 +56,24 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     # Load upstream router (config file driven, disabled if no config)
     router = UpstreamRouter(config.upstreams_config or None)
 
+    # OTLP log writer — 默认写入 run_dir/{date}/otlp.jsonl
+    # 如果 config.otlp_log_dir 已设置（测试用），使用该路径
+    _otlp_base = config.otlp_log_dir or run_dir
+    otlp_writer = OtlpLogWriter(_otlp_base)
+
     app["proxy_ctx"] = {
         "writer": writer,
         "session": client_session,
         "target_url": config.target,
         "timeout": config.timeout,
-        "session_id": session_id,
+        "session_id": run_id,
+        "run_id": run_id,
+        "run_dir": run_dir,
         "router": router,
+        "otlp_log_writer": otlp_writer,
+        "store": store,           # ← MemoryStore (0 I/O runtime reads)
     }
+    app["store"] = store
     app["db"] = db
     app["db_conn"] = db.conn
     app["config"] = config
@@ -64,13 +96,22 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     if add_health:
         app.router.add_get("/health", _health_handler)
 
+    # Internal endpoint: drain MemoryStore write queue (used by tests)
+    async def _flush_handler(request: web.Request) -> web.Response:
+        if store:
+            await store.flush()
+        return web.Response(text="ok")
+
+    app.router.add_post("/__flush", _flush_handler)
+
     async def _shutdown(app: web.Application) -> None:
-        """Ordered shutdown: wait for persists, then close resources."""
-        proxy_ctx = app.get("proxy_ctx", {})
-        persists: set[asyncio.Task] = proxy_ctx.get("_pending_persists", set())
-        if persists:
-            await asyncio.gather(*persists, return_exceptions=True)
+        """Ordered shutdown: flush MemoryStore → SQLite, then close resources."""
+        # Flush MemoryStore pending writes → SQLite (covers all handlers)
+        # No more _pending_persists; all Phase 1/2 writes go through single-writer queue
+        if store:
+            await store.flush_pending()
         await _close_writer(writer)
+        await _close_otlp_log(otlp_writer)
         await _close_session(client_session)
         await _close_db(db)
 
@@ -147,7 +188,12 @@ async def _health_handler(request: web.Request) -> web.Response:
 
 
 async def _close_writer(writer: TraceWriter) -> None:
-    writer.close()
+    await writer.close()
+
+
+async def _close_otlp_log(otlp_writer: OtlpLogWriter | None) -> None:
+    if otlp_writer is not None:
+        otlp_writer.close()
 
 
 async def _close_session(session: aiohttp.ClientSession) -> None:
@@ -158,9 +204,3 @@ async def _close_db(db) -> None:
     db.close()
 
 
-async def _wait_persists(app: web.Application) -> None:
-    """Await any pending persist tasks before shutdown."""
-    proxy_ctx = app.get("proxy_ctx", {})
-    persists: set[asyncio.Task] = proxy_ctx.get("_pending_persists", set())
-    if persists:
-        await asyncio.gather(*persists, return_exceptions=True)

@@ -95,13 +95,15 @@ def find_candidate_sessions(conn: sqlite3.Connection, client_type: str) -> list[
 
 def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str, *,
                         sys: str, tools: str, messages: str,
-                        hash_chain: str, msg_count: int,
+                        sys_hashes: str, tools_hashes: str, messages_hashes: str,
+                        msg_count: int,
                         safe_breakpoints: list[int] | None = None,
                         total_input_tokens: int = 0,
                         is_frozen: bool = False) -> None:
     """Insert or update a prefix chain. Only updates if msg_count is longer.
 
     ``sys``, ``tools``, ``messages`` are JSON strings — canonical form triples.
+    ``sys_hashes``, ``tools_hashes``, ``messages_hashes`` are comma-separated hash strings.
     ``total_input_tokens`` is the upstream's total input token count for this request,
     used for estimating KV cache hit rates on subsequent requests.
     ``is_frozen`` marks a public prefix chain — never updated once created.
@@ -110,9 +112,11 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
     safe_breakpoints_json = json.dumps(safe_breakpoints) if safe_breakpoints is not None else None
     conn.execute("""
         INSERT INTO prefix_chains
-            (session_id, chain_id, sys, tools, messages, hash_chain, msg_count,
+            (session_id, chain_id, sys, tools, messages,
+             sys_hashes, tools_hashes, messages_hashes,
+             msg_count,
              safe_breakpoints, total_input_tokens, is_frozen, created_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chain_id) DO UPDATE SET
             sys = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
                        THEN ? ELSE prefix_chains.sys END,
@@ -120,17 +124,24 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
                          THEN ? ELSE prefix_chains.tools END,
             messages = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
                             THEN ? ELSE prefix_chains.messages END,
-            hash_chain = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                              THEN ? ELSE prefix_chains.hash_chain END,
+            sys_hashes = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                              THEN ? ELSE prefix_chains.sys_hashes END,
+            tools_hashes = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                                THEN ? ELSE prefix_chains.tools_hashes END,
+            messages_hashes = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                                   THEN ? ELSE prefix_chains.messages_hashes END,
             msg_count = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
                              THEN ? ELSE prefix_chains.msg_count END,
             safe_breakpoints = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
                                    THEN ? ELSE prefix_chains.safe_breakpoints END,
             total_input_tokens = CASE WHEN ? > prefix_chains.msg_count THEN ? ELSE prefix_chains.total_input_tokens END,
             last_seen = ?
-    """, (session_id, chain_id, sys, tools, messages, hash_chain, msg_count,
+    """, (session_id, chain_id, sys, tools, messages,
+          sys_hashes, tools_hashes, messages_hashes,
+          msg_count,
           safe_breakpoints_json, total_input_tokens, is_frozen, now, now,
-          msg_count, sys, msg_count, tools, msg_count, messages, msg_count, hash_chain,
+          msg_count, sys, msg_count, tools, msg_count, messages,
+          msg_count, sys_hashes, msg_count, tools_hashes, msg_count, messages_hashes,
           msg_count, msg_count, msg_count, safe_breakpoints_json,
           msg_count, total_input_tokens, now))
     conn.commit()
@@ -214,7 +225,9 @@ def create_prefix_chains_table(conn: sqlite3.Connection) -> None:
             sys         TEXT NOT NULL DEFAULT '[]',
             tools       TEXT NOT NULL DEFAULT '[]',
             messages    TEXT NOT NULL DEFAULT '[]',
-            hash_chain  TEXT NOT NULL,
+            sys_hashes   TEXT NOT NULL DEFAULT '',
+            tools_hashes TEXT NOT NULL DEFAULT '',
+            messages_hashes TEXT NOT NULL DEFAULT '',
             msg_count   INTEGER NOT NULL DEFAULT 0,
             safe_breakpoints TEXT,
             total_input_tokens INTEGER DEFAULT 0,
@@ -230,6 +243,12 @@ def create_prefix_chains_table(conn: sqlite3.Connection) -> None:
         col_type = "INTEGER" if col == "is_frozen" else "TEXT"
         try:
             conn.execute(f"ALTER TABLE prefix_chains ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass
+    # Migration: three-column hash (2026-06-10)
+    for col in ("sys_hashes", "tools_hashes", "messages_hashes"):
+        try:
+            conn.execute(f"ALTER TABLE prefix_chains ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
     conn.commit()
@@ -396,6 +415,7 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
             prefix_chain_id       TEXT DEFAULT NULL,
             trace_category        TEXT DEFAULT NULL,
             system_role_converted INTEGER DEFAULT 0,
+            chat_type             TEXT DEFAULT 'normal',
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE SET NULL,
             FOREIGN KEY (prefix_chain_id) REFERENCES prefix_chains(chain_id) ON DELETE SET NULL
         );
@@ -415,34 +435,22 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE requests DROP COLUMN {col}")
         except sqlite3.OperationalError:
             pass
+    # Migration: add chat_type column (2026-06-09)
+    try:
+        conn.execute("ALTER TABLE requests ADD COLUMN chat_type TEXT DEFAULT 'normal'")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 
 def insert_request_phase1(conn: sqlite3.Connection, ctx, *,
-                          jsonl_offset: int = 0,
-                          session=None) -> None:
+                          jsonl_offset: int = 0) -> None:
     """Unified Phase 1 INSERT: request-side data, ``record_state='pending'``.
 
-    ctx-based — all runtime data is read from ``ctx.req_id``, ``ctx.persist``,
-    and other Context properties.
+    Reads from ``ctx.persist`` (synced by RequestAnalysisStage and CanonicalStage).
     """
-    from deepseek_tap_proxy.shared.session import split_session_fields
-
     model = ctx.body_readonly.get("model", "") if ctx.body_readonly else ""
     timestamp = datetime.now(timezone.utc).isoformat()
-
-    if session is not None:
-        session_id_val, session_fingerprint = split_session_fields(session)
-        session_type_val = session.client_type
-    else:
-        session_id_val = (
-            ctx.persist.session_id
-            or ctx.meta.get("session_uuid")
-            or ctx.meta.get("anthropic_sid")
-            or None
-        )
-        session_fingerprint = ctx.persist.session_fingerprint or ctx.meta.get("session_fingerprint") or None
-        session_type_val = ctx.persist.session_type or ctx.meta.get("session_type") or None
 
     conn.execute("""
         INSERT OR IGNORE INTO requests
@@ -452,9 +460,9 @@ def insert_request_phase1(conn: sqlite3.Connection, ctx, *,
              session_id, session_fingerprint, session_type,
              msg_hash_chain,
              jsonl_path, jsonl_offset, record_state,
-             api_format, trace_category)
+             api_format, trace_category, chat_type)
         VALUES (?, ?, 0, 0, ?, ?, ?, ?, 0, '', ?, ?,
-                ?, ?, ?, ?, 'pending', ?, ?)
+                ?, ?, ?, ?, 'pending', ?, ?, ?)
     """, (
         ctx.req_id,
         timestamp,
@@ -462,28 +470,48 @@ def insert_request_phase1(conn: sqlite3.Connection, ctx, *,
         1 if ctx.is_streaming else 0,
         ctx.persist.prompt_messages_count,
         ctx.persist.prompt_tools_count,
-        session_id_val,
-        session_fingerprint,
-        session_type_val,
+        ctx.persist.session_id or None,
+        "",                                       # session_fingerprint — deprecated
+        ctx.persist.client_type or None,          # session_type → client_type
         ctx.persist.msg_hash_chain,
         ctx.meta.get("jsonl_path", ""),
         jsonl_offset,
         ctx.persist.api_format,
         ctx.persist.trace_category,
+        ctx.persist.chat_type or "normal",
     ))
     conn.commit()
 
 
+# ── 快照标识：区分「未提供快照」和「快照值为 None」──
+_SENTINEL_NO_SNAPSHOT = object()
+
+
 def update_request_phase2(conn: sqlite3.Connection, ctx, *,
-                          jsonl_path: str = '') -> None:
+                          jsonl_path: str = '',
+                          lock_type_snapshot: str | None | object = _SENTINEL_NO_SNAPSHOT,
+                          is_modified_snapshot: bool = False,
+                          mod_note_snapshot: str = "") -> None:
     """Unified Phase 2 UPDATE: fill response data, ``record_state='completed'``.
 
     Reads response data from ``ctx.persist`` (populated by
     ``apply_cache_analysis`` and the ForwardStage), and ``ctx.property`` view
     fields.
+
+    ``lock_type_snapshot`` / ``is_modified_snapshot`` / ``mod_note_snapshot``
+    override ``ctx.persist`` values — callers should pass the values captured
+    immediately after pipeline execution to avoid async closure races.
     """
     prompt_tokens = ctx.persist.total_input_tokens
     completion_tokens = ctx.persist.output_tokens
+    if lock_type_snapshot is _SENTINEL_NO_SNAPSHOT:
+        _lock_type = ctx.persist.lock_type or None
+        _is_modified = int(ctx.persist.is_modified)
+        _mod_note = ctx.persist.modification_note
+    else:
+        _lock_type = lock_type_snapshot  # 可能为 None（无锁）
+        _is_modified = int(is_modified_snapshot)
+        _mod_note = mod_note_snapshot
     conn.execute("""
         UPDATE requests SET
             duration_ms = ?, status_code = ?,
@@ -516,10 +544,10 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
         int(ctx.persist.has_tool_calls),
         jsonl_path,
         ctx.meta.get("jsonl_offset", 0),
-        ctx.persist.lock_type or None,
+        _lock_type,
         ctx.persist.prefix_chain_id or None,
-        int(ctx.persist.is_modified),
-        ctx.persist.modification_note,
+        _is_modified,
+        _mod_note,
         int(ctx.persist.system_role_converted),
         ctx.req_id,
     ))

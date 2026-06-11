@@ -1,32 +1,37 @@
+"""OpenAI API request handler — 使用共享 pipeline 处理 /chat/completions。
+
+Pipeline: ParseStage → CanonicalStage → RequestAnalysisStage
+          → SysToolsLockStage(opt) → PrefixLockStage(opt)
+          → CompactionRewrite → ForwardStage → ReturnStage
+
+Persist 统一走 MemoryStore 单写者队列（v7 架构），
+与 Anthropic handler 对称。
+"""
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import sqlite3
 
 from aiohttp import web
 
 from deepseek_tap_proxy.pipeline import Context, Pipeline
 from deepseek_tap_proxy.router import ResolvedTarget
+from deepseek_tap_proxy.openai.copilot.compression import CompactionRewrite
 from deepseek_tap_proxy.openai.stages import (
     ParseStage, ForwardStage, ReturnStage,
 )
 from deepseek_tap_proxy.shared.stages import (
-    CanonicalStage, SysToolsLockStage, PrefixLockStage,
-    SessionResolverStage, RequestClassifierStage,
+    CanonicalStage, RequestAnalysisStage,
+    SysToolsLockStage, PrefixLockStage,
+    emit_request_log,
 )
-from deepseek_tap_proxy.shared.db import (
-    insert_request_phase1, update_request_phase2,
-)
-from deepseek_tap_proxy.shared.trace import TraceWriter, build_trace_record
-from deepseek_tap_proxy.openai.copilot.compression import CompactionRewrite
+from deepseek_tap_proxy.shared.log import TraceView
+from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait
 
 log: logging.Logger = logging.getLogger("deepseek-tap")
 
 
 async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
-    """Handle /chat/completions via the request pipeline."""
+    """Handle /chat/completions via the shared pipeline."""
     # Resolve upstream target via router (config-driven) or fallback to --target
     proxy_ctx = request.app.get("proxy_ctx", {})
     router = proxy_ctx.get("router")
@@ -60,24 +65,44 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
     )
     ctx = await pipeline.execute(ctx)
 
-    # ── 前缀链优先持久化：管道结束后立即写入，确保下一条请求能命中 ──
+    # ── 前缀链优先持久化 ──
     db = request.app.get("db")
     proxy_ctx = request.app.get("proxy_ctx", {})
-    writer: TraceWriter | None = proxy_ctx.get("writer")
-    persists: set[asyncio.Task] = proxy_ctx.setdefault("_pending_persists", set())
-    if db:
-        _persist_chain_nowait(ctx, db)  # sync via asyncio.to_thread
+    writer = proxy_ctx.get("writer")
 
-    # Background persist (tracked for completion during shutdown)
+    _snapshot_lock_type = ctx.persist.lock_type
+    _snapshot_is_modified = ctx.persist.is_modified
+    _snapshot_mod_note = ctx.persist.modification_note
+
     if db:
-        session = ctx.meta.get("session")
-        t1 = asyncio.create_task(_persist_phase1(ctx, db, session=session))
-        persists.add(t1)
-        t1.add_done_callback(persists.discard)
-    if db and writer:
-        t2 = asyncio.create_task(_persist_phase2(ctx, db, writer, phase1_task=t1 if db else None))
-        persists.add(t2)
-        t2.add_done_callback(persists.discard)
+        persist_chain_nowait(ctx, db)
+
+    # ── 请求元数据持久化：统一走 MemoryStore 单写者队列 ──
+    store = request.app.get("store")
+    if store and ctx.body_readonly is not None:
+        ctx.persist.api_format = "openai"
+        ctx.persist.msg_hash_chain = ctx.msg_hash_chain
+
+        # Phase 1: fire-and-forget insert (state='pending')
+        store.enqueue_request_phase1(ctx)
+
+        if writer:
+            # JSONL: await in event loop
+            try:
+                record = TraceView(ctx).as_dict()
+                jsonl_offset = await writer.write(record)
+                ctx.meta["jsonl_offset"] = jsonl_offset
+            except Exception:
+                log.exception(f"[{ctx.req_id}] JSONL write failed")
+
+            # Phase 2: fire-and-forget update (state='completed')
+            store.enqueue_request_phase2(
+                ctx,
+                jsonl_path=str(writer.path),
+                lock_type_snapshot=_snapshot_lock_type,
+                is_modified_snapshot=_snapshot_is_modified,
+                mod_note_snapshot=_snapshot_mod_note,
+            )
 
     if ctx.response is not None:
         return ctx.response
@@ -85,109 +110,18 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
 
 
 def _build_pipeline(prefix_enabled: bool = False, lock_sys_tools: bool = True) -> Pipeline:
-    """Build the pipeline with Copilot compaction optimization.
-
-    Pipeline: Parse -> SessionResolver -> Canonical -> SysToolsLock(opt) -> PrefixLock(opt) -> CompactionRewrite -> Forward -> Return
-    """
+    """Build the OpenAI pipeline using shared stages."""
     stages = [
         ParseStage(),
-        SessionResolverStage(),
         CanonicalStage(),
-        RequestClassifierStage(),
+        RequestAnalysisStage(),
     ]
     if lock_sys_tools:
         stages.append(SysToolsLockStage())
     if prefix_enabled:
         stages.append(PrefixLockStage())
+    # CompactionRewrite 在锁阶段之后执行，确保不会被 PrefixLock 覆盖
     stages.append(CompactionRewrite())
     stages.append(ForwardStage())
     stages.append(ReturnStage())
     return Pipeline(stages)
-
-
-
-def _persist_get(ctx, key: str, default=None):
-    """Safe getter for ctx.persist — handles mock ctx objects without persist attribute."""
-    persist = getattr(ctx, "persist", None)
-    return getattr(persist, key, default) if persist is not None else default
-
-
-def _get_conn(db) -> sqlite3.Connection:
-    return db.conn if hasattr(db, 'conn') else db
-
-
-def _persist_chain_nowait(ctx: Context, db) -> None:
-    """Write prefix chain synchronously (via to_thread) right after pipeline.
-
-    Ensures the chain is in DB before the next request arrives — no deferring.
-    """
-    ca = getattr(ctx, "chain_action", None)
-    session = ctx.meta.get("session")
-    if ca and ca.action in ("create", "update") and session and ctx.meta.get("intent") != "compaction":
-        from deepseek_tap_proxy.shared.db import upsert_prefix_chain, insert_chain_token
-        from deepseek_tap_proxy.shared.colors import green
-        import json as _json
-
-        chain_tokens = ctx.persist.total_input_tokens or ctx.meta.get("prompt_tokens", 0)
-        conn = _get_conn(db)
-        upsert_prefix_chain(
-            conn, session.key, ca.chain_id,
-            sys=_json.dumps(ca.sys),
-            tools=_json.dumps(ca.tools),
-            messages=_json.dumps(ca.messages),
-            hash_chain=ca.hash_chain,
-            msg_count=ca.msg_count,
-            safe_breakpoints=ca.safe_breakpoints,
-            is_frozen=ca.is_frozen,
-        )
-        insert_chain_token(
-            conn, ca.chain_id,
-            msg_count=ca.msg_count,
-            tokens=chain_tokens,
-            char_count=ca.char_count,
-        )
-        tag = "+ new" if ca.action == "create" else "~ update"
-        print(green(f"  [chain] {tag}: {ca.chain_id[:16]}... ({ca.msg_count} msgs)"))
-
-
-async def _persist_phase1(ctx: Context, db, session=None) -> None:
-    """Phase 1: persist request data (state='pending')."""
-    try:
-        await asyncio.to_thread(
-            lambda: insert_request_phase1(_get_conn(db), ctx, session=session)
-        )
-    except Exception:
-        log.exception(f"[{ctx.req_id}] phase1 persist failed")
-
-
-async def _persist_phase2(ctx: Context, db, writer: TraceWriter, phase1_task: asyncio.Task | None = None) -> None:
-    """Phase 2: update response data, modification flag, and write JSONL.
-
-    Waits for phase1_task to complete first to avoid a race where the
-    UPDATE runs before the INSERT (silently affecting 0 rows), leaving
-    the record stuck in 'pending' state.
-    """
-    try:
-        if phase1_task is not None:
-            await phase1_task
-        record = build_trace_record(ctx)
-        jsonl_offset = await writer.write(record)
-        ctx.meta["jsonl_offset"] = jsonl_offset
-        await asyncio.to_thread(
-            lambda: update_request_phase2(_get_conn(db), ctx, jsonl_path=str(writer.path))
-        )
-        # ── 前缀链已在 _persist_chain_nowait 中优先写入 ──
-        pass
-    except Exception:
-        log.exception(f"[{ctx.req_id}] phase2 persist failed")
-
-
-def _is_normal_conversation(ctx: Context) -> bool:
-    """Check if this is a normal user conversation request (not noise)."""
-    if ctx.meta.get("intent") == "compaction":
-        return False
-    if ctx.meta.get("trace_category") == "auto_title":
-        return False
-    if not ctx.body_readonly:
-        return False
-    return True

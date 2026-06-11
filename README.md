@@ -33,11 +33,12 @@ curl http://localhost:11808/chat/completions \
 ## 功能
 
 - **SysToolsLock** — 同 session 锁定 system + tools 基线
-- **PrefixLock** — 会话前缀修正，保障 APC 缓存命中
+- **PrefixLock** — 三段 hash 前缀匹配，保障 KV cache 命中
 - **Trace** — 每请求 JSONL 完整记录
+- **OTLP** — 结构化日志输出
 - **缓存分析** — 逐请求 cache hit 统计
 - **多上游路由** — API Key 前缀路由到多个上游
-- **Copilot 压缩优化** — 自动识别前台压缩请求
+- **Copilot 压缩优化** — 自动识别前台压缩请求，转换为后台格式
 
 ## 灵感来源
 

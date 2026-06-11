@@ -74,17 +74,8 @@ class AnthropicParseStage(Stage):
             ctx.target_url = proxy_ctx.get("target_url", "")
         ctx.timeout = proxy_ctx.get("timeout", 600)
 
-        # Extract Claude-Code session ID for persist
-        sid = ctx.request.headers.get("X-Claude-Code-Session-Id", "") or \
-              ctx.request.headers.get("x-claude-code-session-id", "")
-        ctx.meta["anthropic_sid"] = sid
-
-        # Session detection via shared/analysis.py
-        from deepseek_tap_proxy.shared.analysis import resolve_session_anthropic
-        system = (ctx.body_readonly or {}).get("system", [])
-        db = ctx.request.app.get("db")
-        session = resolve_session_anthropic(system, dict(ctx.request.headers), db=db)
-        ctx.meta["session"] = session
+        # Session detection is now handled by RequestAnalysisStage
+        # after CanonicalStage.  AnthropicParseStage only parses the body.
 
         # Upstream base URL for persist (only set if handler didn't already)
         if "upstream_base_url" not in ctx.meta:

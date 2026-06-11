@@ -1,14 +1,18 @@
 # DeepSeek Tap Proxy — 一键启动 (PowerShell)
-#   .\run.ps1                         默认 msg0 锁
-#   .\run.ps1 -LockMode prefix        前缀锁
-#   .\run.ps1 -LockMode none          禁用锁
-#   .\run.ps1 -DisableLock            等价
+#   .\run.ps1                                      默认 prefix 锁
+#   .\run.ps1 -LockMode prefix                     前缀锁
+#   .\run.ps1 -LockMode none                       禁用锁
+#   .\run.ps1 -DisableLock                         等价
+#   .\run.ps1 -NoOtlp                              关闭 OTLP JSONL 日志
+#   .\run.ps1 -OtlpLogDir ./data/otlp-logs         自定义 OTLP 输出目录（默认写入 runs/{run_id}/{date}/）
 param(
     [int]$Port = 11808,
     [string]$Target = "https://api.deepseek.com",
     [ValidateSet("msg0", "prefix", "none")]
     [string]$LockMode = "prefix",
-    [switch]$DisableLock
+    [switch]$DisableLock,
+    [switch]$NoOtlp,
+    [string]$OtlpLogDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +47,17 @@ Write-Host "  Port:    $Port" -ForegroundColor Gray
 Write-Host "  Target:  $Target" -ForegroundColor Gray
 Write-Host "  Lock:    $lock  (msg0 / prefix / none)" -ForegroundColor Gray
 Write-Host "  Data:    $PSScriptRoot\data\" -ForegroundColor Gray
+# OTLP 默认写入 runs/{run_id}/{date}/otlp.jsonl（由 server.py 自动处理）
+# 仅当用户显式指定 -NoOtlp 或 -OtlpLogDir 时才修改默认行为
+if ($NoOtlp) {
+    $OtlpLogDir = ""  # 禁用 OTLP
+} elseif ($OtlpLogDir) {
+    Write-Host "  OTLP:    $OtlpLogDir (自定义路径)" -ForegroundColor DarkYellow
+} else {
+    Write-Host "  OTLP:    runs/{run_id}/{date}/otlp.jsonl (默认)" -ForegroundColor DarkYellow
+}
 Write-Host ""
 
-& $python -m deepseek_tap_proxy --port $Port --target $Target --lock-mode $lock
+$otlpArg = if ($OtlpLogDir) { "--otlp-log-dir", $OtlpLogDir } else { @() }
+
+& $python -m deepseek_tap_proxy --port $Port --target $Target --lock-mode $lock @otlpArg

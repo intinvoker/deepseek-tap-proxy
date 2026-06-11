@@ -1,14 +1,5 @@
-"""Anthropic-specific persist helpers (fire-and-forget background tasks)."""
+"""Anthropic-specific persist helpers (pure functions, no I/O)."""
 from __future__ import annotations
-
-import asyncio
-import json
-import logging
-
-from deepseek_tap_proxy.pipeline import Context
-from deepseek_tap_proxy.shared.trace import build_trace_record
-
-log = logging.getLogger("deepseek-tap")
 
 # ── Title generation detection ─────────────────────────────────────────
 
@@ -57,59 +48,6 @@ def _detect_title_gen(req_body: dict | None) -> str | None:
     return "auto_title"
 
 
-def _db_insert_phase1(db, ctx, session=None) -> None:
-    """Thread-safe phase1 insert via shared unified function."""
-    from deepseek_tap_proxy.shared.db import insert_request_phase1
-    conn = db.conn
-    insert_request_phase1(conn, ctx, session=session)
-
-
-def _db_update_phase2(db, ctx, jsonl_path: str = '') -> None:
-    """Thread-safe phase2 update via shared unified function."""
-    from deepseek_tap_proxy.shared.db import update_request_phase2
-    conn = db.conn
-    update_request_phase2(conn, ctx, jsonl_path=jsonl_path)
-
-
-async def persist_anthropic(ctx: Context, db, writer) -> None:
-    """Fire-and-forget: phase1 -> JSONL -> phase2 -> modification flag."""
-    if writer is None or ctx.body_readonly is None:
-        return
-
-    usage = ctx.meta.get("usage", {})
-    sid = ctx.meta.get("anthropic_sid", "")
-    model = (ctx.body_readonly or {}).get("model", "")
-    trace_category = _detect_title_gen(ctx.body_readonly)
-    session = ctx.meta.get("session")
-
-    # Phase 1: recording (use shared unified function)
-    if db is not None:
-        try:
-            ctx.persist.trace_category = trace_category or ""
-            ctx.persist.api_format = "anthropic"
-            await asyncio.to_thread(
-                _db_insert_phase1, db, ctx, session=session,
-            )
-        except Exception:
-            log.exception("[%s] phase1 insert failed", ctx.req_id)
-
-    # JSONL: unified builder
-    try:
-        record = build_trace_record(ctx)
-        if "sse_events" in ctx.meta:
-            record["response"]["sse_events"] = ctx.meta["sse_events"]
-        offset = await writer.write(record)
-    except Exception:
-        log.exception("[%s] JSONL write failed", ctx.req_id)
-        offset = 0
-
-    # Phase 2: completed (use shared unified function)
-    if db is not None:
-        try:
-            ctx.meta["jsonl_offset"] = offset
-            await asyncio.to_thread(
-                _db_update_phase2, db, ctx, jsonl_path=str(writer.path),
-            )
-        except Exception:
-            log.exception("[%s] phase2 update failed", ctx.req_id)
+# ── Phase1/Phase2 persist moved to MemoryStore.enqueue_request_phase* ──
+# (called directly from handler.py via the single-writer queue)
 

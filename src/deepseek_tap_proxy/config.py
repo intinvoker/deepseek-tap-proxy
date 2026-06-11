@@ -12,7 +12,7 @@ class ProxyConfig:
     host: str = "0.0.0.0"
     target: str = "https://api.deepseek.com"
     timeout: int = 600
-    trace_dir: str = "./data/traces"
+    trace_dir: str = "./data/runs"
     db_path: str = "./data/proxy.db"
     lock_mode: str = "prefix"
     strip_user_id: bool = True
@@ -20,6 +20,7 @@ class ProxyConfig:
     log_level: str = "INFO"
     log_file: str = ""  # 日志文件路径，留空则自动设为 data/proxy.log
     upstreams_config: str = ""  # path to upstreams.yaml, empty = router disabled
+    otlp_log_dir: str = ""  # 废弃，由 server.py 从 trace_dir 派生
 
     @classmethod
     def from_args(cls, argv: list[str] | None = None) -> "ProxyConfig":
@@ -31,7 +32,7 @@ class ProxyConfig:
             default=os.getenv("PROXY_TARGET", "https://api.deepseek.com"),
         )
         parser.add_argument("--timeout", type=int, default=600)
-        parser.add_argument("--trace-dir", default="./data/traces")
+        parser.add_argument("--trace-dir", default="./data/runs")
         parser.add_argument("--db-path", default="./data/proxy.db")
         parser.add_argument(
             "--lock-mode", choices=["prefix", "none"], default="prefix",
@@ -62,6 +63,10 @@ class ProxyConfig:
             "--upstreams-config", default="",
             help="Path to upstreams.yaml (multi-upstream routing config)",
         )
+        parser.add_argument(
+            "--otlp-log-dir", default="",
+            help="OTLP JSONL log directory (AI-consumable structured logs, disabled if empty)",
+        )
         args = parser.parse_args(argv)
         cfg = cls(
             port=args.port, host=args.host, target=args.target,
@@ -71,6 +76,7 @@ class ProxyConfig:
             lock_sys_tools=args.lock_sys_tools,
             log_level=args.log_level, log_file=args.log_file,
             upstreams_config=args.upstreams_config,
+            otlp_log_dir=args.otlp_log_dir,
         )
         cfg.trace_dir = str(Path(cfg.trace_dir).resolve())
         cfg.db_path = str(Path(cfg.db_path).resolve())

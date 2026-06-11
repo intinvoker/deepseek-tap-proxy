@@ -36,7 +36,9 @@ class Database:
         conn = sqlite3.connect(self._path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
+        # FK OFF: MemoryStore is source of truth, SQLite is backup.
+        # Fire-and-forget writes may interleave session/request creation.
+        conn.execute("PRAGMA foreign_keys=OFF")
         conn.row_factory = sqlite3.Row
         return conn
 

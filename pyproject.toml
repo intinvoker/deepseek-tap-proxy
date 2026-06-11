@@ -28,6 +28,9 @@ Repository = "https://github.com/intinvoker/deepseek-tap-proxy"
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "pytest-cov", "pytest-timeout"]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [project.scripts]
 deepseek-tap-proxy = "deepseek_tap_proxy.__main__:main"
 
