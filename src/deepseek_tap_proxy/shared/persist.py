@@ -55,9 +55,14 @@ class PersistRecord:
     chain_tokens: int = 0
     chain_ref: Optional['ChainAction'] = None  # 引用，不拷贝，persist 函数内部读
 
-    # ── 修改标记 ──
+    # ═══════════════════════════════════════════════════════════════
+    #  Modification trace — 每列对应一个 Stage 的操作结果。
+    #  规则：枚举值（≤4 个），禁止放数字/摘要。详细数据见 OTLP / JSONL。
+    # ═══════════════════════════════════════════════════════════════
     is_modified: bool = False
-    modification_note: str = ""
+    modification_note: str = ""          # 人类可读（禁止 SQL 查询依赖此字段）
+    system_role_converted: bool = False  # AnthropicSystemRoleConvertStage
+    sys_tools_locked: str = ""           # SysToolsLockStage: init|pass|lock|skip
 
     # ── 归一化 Usage（apply_cache_analysis 写入） ──
     total_input_tokens: int = 0
@@ -71,4 +76,3 @@ class PersistRecord:
 
     # ── Anthropic 专属（始终可选） ──
     trace_category: str = ""
-    system_role_converted: bool = False

@@ -32,12 +32,13 @@ class SysToolsLockStage(Stage):
             return ctx
         if ctx.chat_type == "subagent":
             ctx.meta["sys_tools_locked"] = "skip"
+            ctx.persist.sys_tools_locked = "skip"
             return ctx
 
         session_id = ctx.session_id
         if not session_id:
             return ctx
-        if ctx.client_type not in ("copilot", "copilot-agent"):
+        if ctx.client_type not in ("copilot", "copilot-agent", "claude-code"):
             return ctx
 
         store: MemoryStore | None = ctx.request.app.get("store")
@@ -67,6 +68,7 @@ class SysToolsLockStage(Stage):
             # Fire-and-forget SQLite
             _schedule_canonical_init(store, session_id, cur_sys_json, cur_tools_json)
             ctx.meta["sys_tools_locked"] = "init"
+            ctx.persist.sys_tools_locked = "init"
             ctx.sys_tools_snap = SysToolsSnapshot(
                 action="init",
                 sys=LockSegment(before=sys_before_len, match=0, after=sys_before_len),
@@ -91,6 +93,7 @@ class SysToolsLockStage(Stage):
 
         if not needs_lock:
             ctx.meta["sys_tools_locked"] = "pass"
+            ctx.persist.sys_tools_locked = "pass"
             ctx.sys_tools_snap = SysToolsSnapshot(
                 action="pass",
                 sys=LockSegment(before=sys_before_len, match=sys_before_len, after=sys_before_len),
@@ -108,6 +111,7 @@ class SysToolsLockStage(Stage):
             ctx.tools = restored_tools
 
         ctx.meta["sys_tools_locked"] = "lock"
+        ctx.persist.sys_tools_locked = "lock"
         ctx.sys_tools_snap = SysToolsSnapshot(
             action="lock",
             sys=LockSegment(before=sys_before_len, match=sys_match, after=len(ctx.sys)),

@@ -415,6 +415,7 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
             prefix_chain_id       TEXT DEFAULT NULL,
             trace_category        TEXT DEFAULT NULL,
             system_role_converted INTEGER DEFAULT 0,
+            sys_tools_locked      TEXT DEFAULT NULL,
             chat_type             TEXT DEFAULT 'normal',
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE SET NULL,
             FOREIGN KEY (prefix_chain_id) REFERENCES prefix_chains(chain_id) ON DELETE SET NULL
@@ -438,6 +439,11 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
     # Migration: add chat_type column (2026-06-09)
     try:
         conn.execute("ALTER TABLE requests ADD COLUMN chat_type TEXT DEFAULT 'normal'")
+    except sqlite3.OperationalError:
+        pass
+    # Migration: add sys_tools_locked column (2026-06-12, ADR #17)
+    try:
+        conn.execute("ALTER TABLE requests ADD COLUMN sys_tools_locked TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -528,6 +534,7 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
             is_modified = ?,
             modification_note = ?,
             system_role_converted = ?,
+            sys_tools_locked = ?,
             record_state = 'completed'
         WHERE request_id = ?
     """, (
@@ -549,6 +556,7 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
         _is_modified,
         _mod_note,
         int(ctx.persist.system_role_converted),
+        ctx.persist.sys_tools_locked or None,
         ctx.req_id,
     ))
     conn.commit()
