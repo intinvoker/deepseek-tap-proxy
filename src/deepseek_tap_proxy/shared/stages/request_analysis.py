@@ -59,7 +59,13 @@ class RequestAnalysisStage(Stage):
             ctx.client_type = "generic"
             ctx.session_id = ""
             ctx.session_method = "create"
-        ctx.chat_type = "normal"
+
+        # 检测 auto-title 生成请求
+        from deepseek_tap_proxy.anthropic.persist import _detect_title_gen
+        if _detect_title_gen(ctx.body_readonly):
+            ctx.chat_type = "auto_title"
+        else:
+            ctx.chat_type = "normal"
 
     # ── OpenAI ─────────────────────────────────────────────────────────
 
@@ -182,7 +188,8 @@ class RequestAnalysisStage(Stage):
         from deepseek_tap_proxy.shared.analysis import is_same_session
         from deepseek_tap_proxy.shared.store import MemoryStore
 
-        store: MemoryStore | None = ctx.request.app.get("store")
+        rt = ctx.request.get("runtime")
+        store: MemoryStore | None = rt.store if rt else None
         curr_hashes = ctx.messages_hashes
         threshold = 3 if ctx.orig_msgs_len > 5 else 2
 
@@ -219,7 +226,8 @@ class RequestAnalysisStage(Stage):
 
     def _upsert_session_db(self, ctx: Context, session_id: str) -> None:
         from deepseek_tap_proxy.shared.store import MemoryStore
-        store: MemoryStore | None = ctx.request.app.get("store")
+        rt = ctx.request.get("runtime")
+        store: MemoryStore | None = rt.store if rt else None
         if store:
             store.upsert_session(session_id, ctx.client_type, 0, ctx.messages_hashes)
 

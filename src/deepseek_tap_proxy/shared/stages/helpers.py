@@ -92,7 +92,8 @@ def persist_chain_nowait(ctx, _db=None) -> None:
     from deepseek_tap_proxy.shared.colors import green
     from deepseek_tap_proxy.shared.store import MemoryStore
 
-    store: MemoryStore | None = ctx.request.app.get("store")
+    rt = ctx.request.get("runtime")
+    store: MemoryStore | None = rt.store if rt else None
     chain_tokens = ctx.persist.total_input_tokens or ctx.meta.get("prompt_tokens", 0)
 
     sys_json = json.dumps(ca.sys or ctx.sys)
@@ -130,6 +131,7 @@ def persist_chain_nowait(ctx, _db=None) -> None:
             sys_hashes, tools_hashes, msgs_hashes,
             msg_cnt, ca.safe_breakpoints, ca.is_frozen,
             ca.chain_id, msg_cnt, chain_tokens, ca.char_count,
+            op_name="chain_persist",
         )
 
     tag = "+ new" if ca.action == "create" else "~ update"

@@ -50,6 +50,27 @@ class LogView:
     def terminal(self) -> str:
         """Format as colored ANSI line for terminal output.
 
+        Dispatches to topic-specific formatters:
+          chat          → _terminal_chat (full format)
+          count_tokens  → _terminal_count_tokens (lightweight)
+          passthrough   → _terminal_passthrough (lightweight + path)
+          rejected      → _terminal_rejected (minimal)
+        """
+        c = self._ctx
+        topic = getattr(c, "topic", None) or "?"
+
+        if topic == "count_tokens":
+            return self._terminal_count_tokens()
+        if topic == "passthrough":
+            return self._terminal_passthrough()
+        if topic == "rejected":
+            return self._terminal_rejected()
+        # chat / default: 现有完整格式
+        return self._terminal_chat()
+
+    def _terminal_chat(self) -> str:
+        """Format full log line for chat requests.
+
         Structure:
           [{req_id}] ← {status} {duration}s  lock={type}  slock=...  cache=...  pref(stm)=...  est=...  [upstream, model, session, client, intent]
         """
@@ -125,7 +146,9 @@ class LogView:
         sid_kv = f"sid={sess_id}"
 
         # ── trailing bracket: metadata ──
-        model = c.resp_model or "?"
+        req_m = c.req_model or "?"
+        resp_m = c.resp_model or "?"
+        model = f"{req_m}({resp_m})" if req_m != resp_m else req_m
         upstream = c.meta.get("upstream_name", "default")
         intent = c.chat_type
         if c.meta.get("compaction_fallback_blocked"):
@@ -146,9 +169,44 @@ class LogView:
         kvs.append(est_kv)
         kvs.append(sid_kv)
 
-        trailer = f"[{upstream}, {model}, {c.client_type}, {intent}]"
+        trailer = f"[{c.format}, {upstream}, {model}, {c.client_type}, {intent}]"
 
         return "  ".join([header] + kvs + [trailer])
+
+    def _terminal_count_tokens(self) -> str:
+        """count_tokens 的 terminal 输出：轻量，只显示 tokens 数和来源。"""
+        c = self._ctx
+        source = c.meta.get("tokens_source", "?")
+        tokens = c.meta.get("estimated_tokens", 0) or 0
+        model = c.req_model or "?"
+        sess = c.session_id or ""
+        status = c.status or 0
+        dur = c.duration_ms or 0
+        return (
+            f"[{c.req_id}] ← {status} {dur}ms  "
+            f"path=count_tokens  tokens={tokens}  sid={sess}  "
+            f"[{c.format}, count_tokens, {source}, {model}]"
+        )
+
+    def _terminal_passthrough(self) -> str:
+        """passthrough（FIM/GET 等）的 terminal 输出。"""
+        c = self._ctx
+        upstream = c.meta.get("upstream_name", "default")
+        status = c.status or 0
+        dur = c.duration_ms or 0
+        return (
+            f"[{c.req_id}] ← {status} {dur}ms  "
+            f"path={c.request.path}  sid={c.session_id or ''}  "
+            f"[{c.format}, passthrough, {upstream}]"
+        )
+
+    def _terminal_rejected(self) -> str:
+        """rejected 请求的 terminal 输出：最简。"""
+        c = self._ctx
+        return (
+            f"[{c.req_id}] ← {c.status or 404} 0ms  "
+            f"path={c.request.path}  [{c.format}, rejected]"
+        )
 
     # ── OTLP JSONL (AI consumption) ────────────────────────────────
 
@@ -195,6 +253,7 @@ class LogView:
             _otlp_attr("duration_ms", c.duration_ms or 0),
             _otlp_attr("api_format", c.format),
             _otlp_attr("model", c.resp_model or "?"),
+            _otlp_attr("request_model", c.req_model or "?"),
             _otlp_attr("client_type", c.client_type),
             _otlp_attr("session_type", c.client_type),
             _otlp_attr("session_method", c.session_method),
@@ -275,9 +334,10 @@ class TraceView:
             "upstream_base_url": c.target_url,
             "upstream_name": c.meta.get("upstream_name", "default"),
             "api_format": r.api_format,
+            "topic": c.topic,
             "request": {
-                "method": "POST",
-                "path": c.request.path,
+                "method": c.request.method,
+                "path": c.request.path_qs,
                 "headers": redact(dict(c.request.headers)),
                 "body": c.body_readonly,
             },
@@ -397,12 +457,15 @@ def _otlp_severity(status: int) -> tuple[int, str]:
 def _build_otlp_record(ctx, run_id: str) -> dict:
     """Build a standard OTLP LogRecord dict (not wrapped in ExportLogsServiceRequest).
 
-    Compatible with OpenTelemetry LogRecord protobuf JSON mapping and Aspire Dashboard.
+    Attributes are selected based on ctx.topic:
+      chat          → base + full chat-specific fields
+      count_tokens  → base + tokens_source, estimated_tokens
+      passthrough   → base + upstream_name
+      rejected/*    → base only
     """
     status = ctx.status or 0
     severity_number, severity_text = _otlp_severity(status)
     now_ns = time.time_ns()
-    p = ctx.persist
 
     attributes = []
 
@@ -412,28 +475,28 @@ def _build_otlp_record(ctx, run_id: str) -> dict:
     def _int_attr(key: str, value: int):
         attributes.append({"key": key, "value": {"intValue": value}})
 
+    # ── Base attributes for all topics ──
     _str_attr("run_id", run_id)
     _str_attr("req_id", ctx.req_id)
     _int_attr("status_code", status)
     _int_attr("duration_ms", ctx.duration_ms or 0)
     _str_attr("api_format", ctx.format or "")
-    _str_attr("client_type", ctx.client_type or "")
-    _str_attr("chat_type", ctx.chat_type or "")
-    _str_attr("model", p.model or "")
+    _str_attr("topic", getattr(ctx, "topic", None) or "")
+    _str_attr("request_path", getattr(getattr(ctx, "request", None), "path", ""))
+    model = getattr(ctx, "resp_model", None) or getattr(ctx, "req_model", None) or "?"
+    _str_attr("model", model)
     _str_attr("session_id", ctx.session_id or "")
-    _str_attr("session_method", ctx.session_method or "")
-    _str_attr("upstream_name", ctx.meta.get("upstream_name", "default"))
-    _str_attr("lock_type", p.lock_type or "")
-    _str_attr("sys_tools_locked", ctx.meta.get("sys_tools_locked", ""))
-    _int_attr("cache_hit_tokens", p.cache_hit_tokens or 0)
-    _int_attr("cache_miss_tokens", p.cache_miss_tokens or 0)
-    _int_attr("pref_hit_count", ctx.meta.get("pref_hit_count", 0))
 
-    chain_action = getattr(ctx, "chain_action", None)
-    if chain_action and chain_action.action:
-        _str_attr("chain_action", chain_action.action)
-        if chain_action.chain_id:
-            _str_attr("chain_id", chain_action.chain_id[:16])
+    # ── Topic-specific attributes ──
+    topic = getattr(ctx, "topic", None) or ""
+    if topic == "count_tokens":
+        _str_attr("tokens_source", ctx.meta.get("tokens_source", "?"))
+        _int_attr("estimated_tokens", ctx.meta.get("estimated_tokens", 0))
+    elif topic == "passthrough":
+        _str_attr("upstream_name", ctx.meta.get("upstream_name", "default"))
+    elif topic == "chat":
+        attributes.extend(_chat_otlp_attrs(ctx))
+    # rejected / unknown: only base attrs
 
     return {
         "timeUnixNano": str(now_ns),
@@ -445,6 +508,32 @@ def _build_otlp_record(ctx, run_id: str) -> dict:
         "droppedAttributesCount": 0,
         "flags": 0,
     }
+
+
+def _chat_otlp_attrs(ctx) -> list[dict]:
+    """chat topic 的 OTLP 专属字段——当前 _build_otlp_record 中全部非基础字段。"""
+    c = ctx
+    p = ctx.persist
+    ca = getattr(c, "chain_action", None)
+
+    attrs = [
+        {"key": "client_type", "value": {"stringValue": c.client_type or ""}},
+        {"key": "chat_type", "value": {"stringValue": c.chat_type or ""}},
+        {"key": "session_method", "value": {"stringValue": c.session_method or ""}},
+        {"key": "upstream_name", "value": {"stringValue": c.meta.get("upstream_name", "default")}},
+        {"key": "lock_type", "value": {"stringValue": p.lock_type or ""}},
+        {"key": "sys_tools_locked", "value": {"stringValue": c.meta.get("sys_tools_locked", "")}},
+        {"key": "cache_hit_tokens", "value": {"intValue": p.cache_hit_tokens or 0}},
+        {"key": "cache_miss_tokens", "value": {"intValue": p.cache_miss_tokens or 0}},
+        {"key": "pref_hit_count", "value": {"intValue": c.meta.get("pref_hit_count", 0)}},
+    ]
+
+    if ca and ca.action:
+        attrs.append({"key": "chain_action", "value": {"stringValue": ca.action}})
+        if ca.chain_id:
+            attrs.append({"key": "chain_id", "value": {"stringValue": ca.chain_id[:16]}})
+
+    return attrs
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -521,7 +610,8 @@ def emit_request_log(ctx: Context) -> None:
     log.info(view.terminal())
 
     # OTLP JSONL — 同步写入（OtlpLogWriter.write 使用 threading.Lock，不在 event loop 内阻塞）
-    proxy_ctx = ctx.request.app.get("proxy_ctx", {})
+    rt = ctx.request.get("runtime")
+    proxy_ctx = {"otlp_log_writer": rt.otlp_writer, "run_id": rt.run_id} if rt else {}
     otlp_writer: OtlpLogWriter | None = proxy_ctx.get("otlp_log_writer")
     run_id = proxy_ctx.get("run_id", "")
     if otlp_writer is not None and run_id:

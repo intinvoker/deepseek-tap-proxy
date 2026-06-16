@@ -92,7 +92,7 @@ async def async_main() -> None:
     await site.start()
 
     log = logging.getLogger("deepseek-tap")
-    log.info("Proxy session: %s", app.get("proxy_ctx", {}).get("session_id", ""))
+    log.info("Proxy session: %s", app.get("proxy_ctx", {}).get("run_id", ""))
     if config.log_file:
         log.info("Log file: %s", config.log_file)
 

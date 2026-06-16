@@ -26,32 +26,83 @@ _OPENAI_MAP: dict[str, str] = {
 }
 
 
+def _extract_nested_cached_tokens(usage: dict) -> int | None:
+    """Extract cache_read tokens from nested usage structures.
+
+    Handles vendor-specific nested formats where cache information
+    is inside ``input_tokens_details`` or ``prompt_tokens_details``
+    rather than at the top level.
+
+    Returns the cached token count, or ``None`` if no nested
+    cache information is found.
+    """
+    for details_key in ("input_tokens_details", "prompt_tokens_details"):
+        details = usage.get(details_key)
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+            if cached is not None:
+                return cached
+    return None
+
+
 def normalize_openai(usage: dict) -> dict:
     """Normalize OpenAI-format usage dict.
 
-    OpenAI 的 input_tokens(=prompt_tokens) 已经是总输入，
-    不需要额外计算 total_input_tokens。
+    Handles flat key mapping (``_OPENAI_MAP``) plus nested fallback
+    for ``prompt_tokens_details.cached_tokens`` etc.  Computes
+    ``cache_miss_input_tokens`` and ``total_input_tokens``.
     """
     if not isinstance(usage, dict):
         return {}
     if not usage:
         return {}
 
+    # ── 1. Flat key mapping ──
     normalized: dict = {}
     for raw_key, value in usage.items():
         mapped_key = _OPENAI_MAP.get(raw_key, raw_key)
+        # Prefer non-zero value when multiple raw keys map to same normalized key
+        # (e.g. input_tokens=0 and prompt_tokens=5 — the 5 should win)
+        if mapped_key in normalized and normalized[mapped_key] and not value:
+            continue
         normalized[mapped_key] = value
-    # OpenAI 的 input_tokens 已经是总 token
+
+    # ── 2. Nested fallback for cache_read ──
+    if "cache_read_input_tokens" not in normalized:
+        nested = _extract_nested_cached_tokens(usage)
+        if nested is not None:
+            normalized["cache_read_input_tokens"] = nested
+
+    # ── 3. Defaults ──
+    normalized.setdefault("cache_creation_input_tokens", 0)
+    normalized.setdefault("cache_read_input_tokens", 0)
+
+    # ── 4. Miss: flat key priority, else compute ──
+    miss = usage.get("prompt_cache_miss_tokens")
+    if miss is not None:
+        normalized["cache_miss_input_tokens"] = miss
+    else:
+        raw_input = normalized.get("input_tokens", 0) or 0
+        cache_read = normalized.get("cache_read_input_tokens", 0) or 0
+        normalized["cache_miss_input_tokens"] = max(0, raw_input - cache_read)
+
+    # ── 5. total_input_tokens ──
     input_t = normalized.get("input_tokens", 0) or 0
     normalized["total_input_tokens"] = input_t
+
     return normalized
 
 
 def normalize_anthropic(usage: dict) -> dict:
     """Normalize Anthropic-format usage dict.
 
-    Anthropic 格式的 input_tokens 是"未命中部分"（需计算的 token），
-    不是总输入。总输入 = input_tokens + cache_read_input_tokens。
+    标准 Anthropic 格式：
+      input_tokens                 = 总输入 token
+      cache_read_input_tokens      = 缓存命中 token
+      cache_creation_input_tokens  = 缓存创建 token
+      cache_miss_input_tokens      = 未命中 token = input_tokens - cache_read
+
+    总输入 = cache_miss + cache_read = input_tokens
     """
     if not isinstance(usage, dict):
         return {}
@@ -69,30 +120,25 @@ def normalize_anthropic(usage: dict) -> dict:
         if cached is None:
             cached = usage.get("cachedContentTokenCount")
         if cached is None:
-            for details_key in ("input_tokens_details", "prompt_tokens_details"):
-                details = usage.get(details_key)
-                if isinstance(details, dict):
-                    cached = details.get("cached_tokens")
-                    if cached is not None:
-                        break
+            cached = _extract_nested_cached_tokens(usage)
         if cached is not None:
             normalized["cache_read_input_tokens"] = cached
 
     normalized.setdefault("cache_creation_input_tokens", 0)
+    normalized.setdefault("cache_read_input_tokens", 0)
 
-    # Anthropic 的 input_tokens 本身就是 cache_miss（未命中部分）
-    if "cache_miss_input_tokens" not in normalized:
-        miss = usage.get("prompt_cache_miss_tokens")
-        if miss is not None:
-            normalized["cache_miss_input_tokens"] = miss
-        elif usage.get("input_tokens") is not None:
-            # DeepSeek Anthropic: input_tokens 就是 miss 部分
-            normalized["cache_miss_input_tokens"] = usage["input_tokens"]
+    # miss: 优先用 prompt_cache_miss_tokens，否则 input_tokens - cache_read
+    miss = usage.get("prompt_cache_miss_tokens")
+    if miss is not None:
+        normalized["cache_miss_input_tokens"] = miss
+    else:
+        raw_input = normalized.get("input_tokens", 0) or 0
+        cache_read = normalized.get("cache_read_input_tokens", 0) or 0
+        normalized["cache_miss_input_tokens"] = max(0, raw_input - cache_read)
 
-    # 总输入 token = input_tokens + cache_read_input_tokens
+    # 总输入 = input_tokens（标准 Anthropic 格式的 input_tokens 就是总输入）
     raw_input = normalized.get("input_tokens", 0) or 0
-    cache_read = normalized.get("cache_read_input_tokens", 0) or 0
-    normalized["total_input_tokens"] = raw_input + cache_read
+    normalized["total_input_tokens"] = raw_input
 
     return normalized
 

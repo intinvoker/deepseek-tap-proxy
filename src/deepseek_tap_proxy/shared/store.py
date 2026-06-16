@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -88,6 +89,15 @@ class ChainTokenRecord:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  写者线程常量
+# ═══════════════════════════════════════════════════════════════════════
+
+# 单次写失败后的重试次数（不包含首次尝试）
+_MAX_RETRIES = 2
+# 每次重试前的休眠秒数（指数退避）
+_RETRY_DELAYS = [0.1, 0.5]  # 100ms → 500ms
+
+# ═══════════════════════════════════════════════════════════════════════
 #  MemoryStore
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -114,6 +124,17 @@ class MemoryStore:
         # Single-writer queue for SQLite (prevents "database is locked")
         self._write_queue: asyncio.Queue | None = None
         self._writer_task: asyncio.Task | None = None
+
+        # write stats — 写熔断可复盘能力
+        self._write_successes: int = 0
+        self._write_failures: int = 0
+        self._last_write_success: str = ""
+        self._last_write_failure: str = ""
+        # op_name → 失败次数（按操作类型聚合）
+        self._write_failures_by_op: dict[str, int] = {}
+        # 异常类型 → 失败次数（按错误类型聚合）
+        self._write_failures_by_error: dict[str, int] = {}
+
         if db is not None:
             self._write_queue = asyncio.Queue()
             self._start_writer()
@@ -204,7 +225,8 @@ class MemoryStore:
             conn.commit()
 
         self.enqueue_sqlite_write(_write, session_id, client_type, anchor_msg_index,
-                                  hash_str, hash_len, now)
+                                  hash_str, hash_len, now,
+                                  op_name="session_persist")
 
     def update_session_hash_chain(self, session_id: str, curr_hashes: list[str]) -> None:
         existing = self._sessions.get(session_id)
@@ -377,19 +399,84 @@ class MemoryStore:
 
         def _thread_worker():
             conn = db.conn  # thread-local: creates connection in THIS thread
+            _consecutive_failures = 0
+            _MAX_CONSECUTIVE_FAILURES = 20  # ~5 min at 17s/item, recycle connection
+
             while True:
                 item = _q.get()
                 if item is None:  # sentinel
                     break
-                sync_fn, args = item
-                try:
-                    sync_fn(conn, *args)
-                except Exception:
-                    log.exception("MemoryStore: SQLite write failed")
+
+                # item = (sync_fn, args) or (sync_fn, args, op_name)
+                if len(item) == 3:
+                    sync_fn, args, op_name = item
+                else:
+                    sync_fn, args = item
+                    op_name = ""
+
+                last_exc: Exception | None = None
+                _rollback_ok = True
+                for attempt in range(_MAX_RETRIES + 1):
+                    try:
+                        sync_fn(conn, *args)
+                        # success
+                        self._write_successes += 1
+                        self._last_write_success = datetime.now(timezone.utc).isoformat()
+                        last_exc = None
+                        _consecutive_failures = 0
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        # 根因修复：commit() 失败后事务仍活跃，必须 rollback
+                        try:
+                            conn.rollback()
+                            _rollback_ok = True
+                        except Exception:
+                            _rollback_ok = False
+                        if attempt < _MAX_RETRIES:
+                            _time.sleep(_RETRY_DELAYS[attempt])
+                        # last attempt: falls through to error logging
+
+                if last_exc:
+                    _consecutive_failures += 1
+                    self._write_failures += 1
+                    ts = datetime.now(timezone.utc).isoformat()
+                    self._last_write_failure = ts
+                    reason = type(last_exc).__qualname__
+                    self._write_failures_by_error[reason] = \
+                        self._write_failures_by_error.get(reason, 0) + 1
+                    if op_name:
+                        self._write_failures_by_op[op_name] = \
+                            self._write_failures_by_op.get(op_name, 0) + 1
+                    log.error(
+                        "MemoryStore: SQLite write failed after %d attempt(s): %s | "
+                        "op=%s queue_depth=%d successes=%d failures=%d "
+                        "consecutive=%d rollback_ok=%s",
+                        _MAX_RETRIES + 1, last_exc,
+                        op_name or "?", _q.qsize(),
+                        self._write_successes, self._write_failures,
+                        _consecutive_failures, _rollback_ok,
+                    )
+
+                    # 连接退化：连续失败超过阈值 → 关闭旧连接创建新连接
+                    if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                        log.warning(
+                            "MemoryStore: writer connection degraded (%d consecutive failures), "
+                            "recycling connection...",
+                            _consecutive_failures,
+                        )
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = db.conn  # fresh connection, new file handle
+                        _consecutive_failures = 0
+                        log.info("MemoryStore: writer connection recycled successfully")
+
             _q.task_done()
 
         import threading
-        t = threading.Thread(target=_thread_worker, daemon=True)
+        t = threading.Thread(target=_thread_worker, daemon=True, name="sqlite-writer")
         t.start()
 
         try:
@@ -402,15 +489,17 @@ class MemoryStore:
             _q.put(None)  # stop thread worker
             t.join(timeout=5)
 
-    def enqueue_sqlite_write(self, sync_fn, *args) -> None:
+    def enqueue_sqlite_write(self, sync_fn, *args, op_name: str = "") -> None:
         """Fire-and-forget: queue a SQLite write for the background writer.
 
         The sync_fn receives the SQLite connection as first argument.
         MemoryStore is already updated (0 I/O) — this is durability only.
+
+        ``op_name`` is a human-readable label for observability (stats / health).
         """
         if self._write_queue is None:
             return
-        self._write_queue.put_nowait((sync_fn, args))
+        self._write_queue.put_nowait((sync_fn, args, op_name))
 
     async def flush(self) -> None:
         """Drain all pending SQLite writes without stopping the writer.
@@ -446,6 +535,37 @@ class MemoryStore:
                 self._writer_task.cancel()
             self._writer_task = None
 
+    # ══════════════════════════════════════════════════════════════════
+    #  Write stats (observability / health)
+    # ══════════════════════════════════════════════════════════════════
+
+    def get_write_stats(self) -> dict:
+        """Return write failure metrics for health endpoint / post-mortem.
+
+        Includes per-operation-type failure counts so operators can see
+        which table path is failing (``req_phase1``, ``req_phase2``,
+        ``session_persist``, ``chain_persist``, etc.).
+        """
+        queue_depth = 0
+        if self._write_queue is not None:
+            try:
+                queue_depth = self._write_queue.qsize()
+            except NotImplementedError:
+                pass
+        return {
+            "writes_attempted": self._write_successes + self._write_failures,
+            "writes_succeeded": self._write_successes,
+            "writes_failed": self._write_failures,
+            "failure_rate": round(
+                self._write_failures / max(self._write_successes + self._write_failures, 1), 4
+            ),
+            "last_success": self._last_write_success,
+            "last_failure": self._last_write_failure,
+            "failures_by_op": dict(self._write_failures_by_op),
+            "failures_by_error": dict(self._write_failures_by_error),
+            "queue_depth": queue_depth,
+        }
+
     # ── Lifecycle ───────────────────────────────────────────────
 
     @classmethod
@@ -457,87 +577,97 @@ class MemoryStore:
             conn = db.conn if hasattr(db, 'conn') else db
             now = datetime.now(timezone.utc).isoformat()
 
-            # Clean up orphaned pending records from previous crash
             try:
-                deleted = conn.execute(
-                    "DELETE FROM requests WHERE record_state = 'pending'"
-                ).rowcount
-                if deleted:
+                # Clean up orphaned pending records from previous crash
+                try:
+                    deleted = conn.execute(
+                        "DELETE FROM requests WHERE record_state = 'pending'"
+                    ).rowcount
                     conn.commit()
-                    log.info("MemoryStore: cleaned up %d orphaned pending record(s)", deleted)
-            except sqlite3.OperationalError:
-                pass
+                    if deleted:
+                        log.info("MemoryStore: cleaned up %d orphaned pending record(s)", deleted)
+                except sqlite3.OperationalError:
+                    pass
 
-            # Load sessions
-            try:
-                rows = conn.execute("SELECT * FROM sessions").fetchall()
-                for row in rows:
-                    d = dict(row)
-                    store._sessions[d["session_id"]] = SessionRecord(
-                        session_id=d.get("session_id", ""),
-                        client_type=d.get("client_type", ""),
-                        anchor_msg_index=d.get("anchor_msg_index", 0),
-                        max_hash_chain=d.get("max_hash_chain", ""),
-                        hash_chain_length=d.get("hash_chain_length", 0),
-                        start_time=d.get("start_time", now),
-                        last_seen_time=d.get("last_seen_time", now),
-                        total_requests=d.get("total_requests", 1),
-                        canonical_sys=d.get("canonical_sys", ""),
-                        canonical_tools=d.get("canonical_tools", ""),
-                    )
-            except sqlite3.OperationalError:
-                pass
+                # Load sessions
+                try:
+                    rows = conn.execute("SELECT * FROM sessions").fetchall()
+                    for row in rows:
+                        d = dict(row)
+                        store._sessions[d["session_id"]] = SessionRecord(
+                            session_id=d.get("session_id", ""),
+                            client_type=d.get("client_type", ""),
+                            anchor_msg_index=d.get("anchor_msg_index", 0),
+                            max_hash_chain=d.get("max_hash_chain", ""),
+                            hash_chain_length=d.get("hash_chain_length", 0),
+                            start_time=d.get("start_time", now),
+                            last_seen_time=d.get("last_seen_time", now),
+                            total_requests=d.get("total_requests", 1),
+                            canonical_sys=d.get("canonical_sys", ""),
+                            canonical_tools=d.get("canonical_tools", ""),
+                        )
+                except sqlite3.OperationalError:
+                    pass
 
-            # Load prefix chains
-            try:
-                rows = conn.execute("SELECT * FROM prefix_chains ORDER BY last_seen DESC").fetchall()
-                for row in rows:
-                    d = dict(row)
-                    rec = ChainRecord(
-                        chain_id=d.get("chain_id", ""),
-                        session_id=d.get("session_id", ""),
-                        sys=d.get("sys", "[]"),
-                        tools=d.get("tools", "[]"),
-                        messages=d.get("messages", "[]"),
-                        sys_hashes=d.get("sys_hashes", ""),
-                        tools_hashes=d.get("tools_hashes", ""),
-                        messages_hashes=d.get("messages_hashes", ""),
-                        msg_count=d.get("msg_count", 0),
-                        safe_breakpoints=d.get("safe_breakpoints"),
-                        total_input_tokens=d.get("total_input_tokens", 0),
-                        is_frozen=bool(d.get("is_frozen", 0)),
-                        created_at=d.get("created_at", now),
-                        last_seen=d.get("last_seen", now),
-                    )
-                    store._chains.setdefault(rec.session_id, {}) \
-                        .setdefault(store.compute_family_key(rec.sys_hashes, rec.tools_hashes), []) \
-                        .append(rec)
-            except sqlite3.OperationalError:
-                pass
+                # Load prefix chains
+                try:
+                    rows = conn.execute("SELECT * FROM prefix_chains ORDER BY last_seen DESC").fetchall()
+                    for row in rows:
+                        d = dict(row)
+                        rec = ChainRecord(
+                            chain_id=d.get("chain_id", ""),
+                            session_id=d.get("session_id", ""),
+                            sys=d.get("sys", "[]"),
+                            tools=d.get("tools", "[]"),
+                            messages=d.get("messages", "[]"),
+                            sys_hashes=d.get("sys_hashes", ""),
+                            tools_hashes=d.get("tools_hashes", ""),
+                            messages_hashes=d.get("messages_hashes", ""),
+                            msg_count=d.get("msg_count", 0),
+                            safe_breakpoints=d.get("safe_breakpoints"),
+                            total_input_tokens=d.get("total_input_tokens", 0),
+                            is_frozen=bool(d.get("is_frozen", 0)),
+                            created_at=d.get("created_at", now),
+                            last_seen=d.get("last_seen", now),
+                        )
+                        store._chains.setdefault(rec.session_id, {}) \
+                            .setdefault(store.compute_family_key(rec.sys_hashes, rec.tools_hashes), []) \
+                            .append(rec)
+                except sqlite3.OperationalError:
+                    pass
 
-            # Load chain token history
-            try:
-                rows = conn.execute(
-                    "SELECT * FROM chain_token_history ORDER BY chain_id, msg_count ASC"
-                ).fetchall()
-                for row in rows:
-                    d = dict(row)
-                    rec = ChainTokenRecord(
-                        chain_id=d.get("chain_id", ""),
-                        msg_count=d.get("msg_count", 0),
-                        tokens=d.get("tokens", 0),
-                        char_count=d.get("char_count", 0),
-                        created_at=d.get("created_at", now),
-                    )
-                    store._token_history.setdefault(rec.chain_id, []).append(rec)
-            except sqlite3.OperationalError:
-                pass
+                # Load chain token history
+                try:
+                    rows = conn.execute(
+                        "SELECT * FROM chain_token_history ORDER BY chain_id, msg_count ASC"
+                    ).fetchall()
+                    for row in rows:
+                        d = dict(row)
+                        rec = ChainTokenRecord(
+                            chain_id=d.get("chain_id", ""),
+                            msg_count=d.get("msg_count", 0),
+                            tokens=d.get("tokens", 0),
+                            char_count=d.get("char_count", 0),
+                            created_at=d.get("created_at", now),
+                        )
+                        store._token_history.setdefault(rec.chain_id, []).append(rec)
+                except sqlite3.OperationalError:
+                    pass
 
-            log.info(
-                "MemoryStore loaded from DB: %d sessions, %d chains, %d token records",
-                len(store._sessions), sum(len(c) for c in store._chains.values()),
-                sum(len(h) for h in store._token_history.values()),
-            )
+                log.info(
+                    "MemoryStore loaded from DB: %d sessions, %d chains, %d token records",
+                    len(store._sessions), sum(len(c) for c in store._chains.values()),
+                    sum(len(h) for h in store._token_history.values()),
+                )
+            finally:
+                # Close the load-thread Database connection to release any
+                # lingering RESERVED locks before the fire-and-forget writer
+                # thread starts making writes. Database.close() clears the
+                # thread-local connection so a fresh one is created on demand.
+                if hasattr(db, 'close'):
+                    db.close()
+                elif hasattr(conn, 'close'):
+                    conn.close()
 
         await asyncio.to_thread(_load)
         return store
@@ -564,7 +694,8 @@ class MemoryStore:
             _ctx.persist.msg_hash_chain = _mhc
             insert_request_phase1(conn, _ctx)
 
-        self.enqueue_sqlite_write(_write, ctx, _api_format, _trace_category, _msg_hash_chain)
+        self.enqueue_sqlite_write(_write, ctx, _api_format, _trace_category, _msg_hash_chain,
+                                  op_name="req_phase1")
 
     def enqueue_request_phase2(self, ctx, *,
                                 jsonl_path: str = "",
@@ -591,4 +722,5 @@ class MemoryStore:
         self.enqueue_sqlite_write(
             _write, ctx, jsonl_path,
             _lt, is_modified_snapshot, mod_note_snapshot,
+            op_name="req_phase2",
         )

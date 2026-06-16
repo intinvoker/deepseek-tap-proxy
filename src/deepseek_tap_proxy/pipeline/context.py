@@ -93,6 +93,16 @@ class Context:
     def elapsed_ms(self) -> int:
         return int((time.monotonic() - self._t0) * 1000)
 
+    # -- topic --------------------------------------------------------
+
+    @property
+    def topic(self) -> str:
+        return self.persist.topic
+
+    @topic.setter
+    def topic(self, value: str) -> None:
+        self.persist.topic = value
+
     # ═══════════════════════════════════════════════════════════════
     #  Canonical form: sys / tools / messages
     # ═══════════════════════════════════════════════════════════════
@@ -272,6 +282,11 @@ class Context:
             m = self.resp_body.get("model")
             if m:
                 return m
+        return (self.body_readonly or {}).get("model", "")
+
+    @property
+    def req_model(self) -> str:
+        """原始请求中的模型名（不受上游响应影响）。"""
         return (self.body_readonly or {}).get("model", "")
 
     @property

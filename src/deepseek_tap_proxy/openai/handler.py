@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+import aiohttp
 from aiohttp import web
 
 from deepseek_tap_proxy.pipeline import Context, Pipeline
@@ -22,9 +23,8 @@ from deepseek_tap_proxy.openai.stages import (
 from deepseek_tap_proxy.shared.stages import (
     CanonicalStage, RequestAnalysisStage,
     SysToolsLockStage, PrefixLockStage,
-    emit_request_log,
 )
-from deepseek_tap_proxy.shared.log import TraceView
+from deepseek_tap_proxy.shared.consumers import run_consumers
 from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait
 
 log: logging.Logger = logging.getLogger("deepseek-tap")
@@ -33,14 +33,14 @@ log: logging.Logger = logging.getLogger("deepseek-tap")
 async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
     """Handle /chat/completions via the shared pipeline."""
     # Resolve upstream target via router (config-driven) or fallback to --target
-    proxy_ctx = request.app.get("proxy_ctx", {})
-    router = proxy_ctx.get("router")
+    rt = request.get("runtime")
+    router = rt.router if rt else None
     resolved = None
     if router is not None and router.is_available:
         resolved = router.resolve(request.headers.get("Authorization"))
     if resolved is None:
         resolved = ResolvedTarget(
-            target_url=proxy_ctx.get("target_url", ""),
+            target_url=getattr(rt.config, "target", "") if rt and rt.config else "",
             upstream_name="default",
             matched_key_prefix=None,
         )
@@ -54,7 +54,8 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
     ctx = Context(request=request)
     ctx.target_url = resolved.target_url
 
-    config = request.app.get("config", {})
+    rt = request.get("runtime")
+    config = rt.config if rt else {}
     lock_mode = getattr(config, "lock_mode", "prefix")
     lock_sys_tools = getattr(config, "lock_sys_tools", True)
     prefix_enabled: bool = lock_mode == "prefix"
@@ -64,6 +65,7 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
         lock_sys_tools=lock_sys_tools,
     )
     ctx = await pipeline.execute(ctx)
+    ctx.topic = "chat"  # OpenAI /chat/completions 始终是 chat topic
 
     # ── 前缀链优先持久化 ──
     db = request.app.get("db")
@@ -78,7 +80,7 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
         persist_chain_nowait(ctx, db)
 
     # ── 请求元数据持久化：统一走 MemoryStore 单写者队列 ──
-    store = request.app.get("store")
+    store = rt.store if rt else None
     if store and ctx.body_readonly is not None:
         ctx.persist.api_format = "openai"
         ctx.persist.msg_hash_chain = ctx.msg_hash_chain
@@ -86,27 +88,66 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
         # Phase 1: fire-and-forget insert (state='pending')
         store.enqueue_request_phase1(ctx)
 
-        if writer:
-            # JSONL: await in event loop
-            try:
-                record = TraceView(ctx).as_dict()
-                jsonl_offset = await writer.write(record)
-                ctx.meta["jsonl_offset"] = jsonl_offset
-            except Exception:
-                log.exception(f"[{ctx.req_id}] JSONL write failed")
-
-            # Phase 2: fire-and-forget update (state='completed')
-            store.enqueue_request_phase2(
-                ctx,
-                jsonl_path=str(writer.path),
-                lock_type_snapshot=_snapshot_lock_type,
-                is_modified_snapshot=_snapshot_is_modified,
-                mod_note_snapshot=_snapshot_mod_note,
-            )
+        await run_consumers(
+            ctx,
+            writer=writer,
+            store=store,
+            otlp_writer=proxy_ctx.get("otlp_log_writer"),
+            run_id=proxy_ctx.get("run_id", ""),
+            lock_type_snapshot=_snapshot_lock_type,
+            is_modified_snapshot=_snapshot_is_modified,
+            mod_note_snapshot=_snapshot_mod_note,
+        )
 
     if ctx.response is not None:
         return ctx.response
     return web.Response(status=502, text="No response from pipeline")
+
+
+async def fim_passthrough_handler(request: web.Request) -> web.Response:
+    """Passthrough FIM /completions and /beta/completions requests to upstream."""
+    rt = request.get("runtime")
+    session = getattr(rt.transport, '_session', None) if rt else None
+    if session is None:
+        return web.Response(status=502, text="Transport not configured")
+    target = getattr(rt.config, "target", "") if rt and rt.config else ""
+    path_prefix = ""
+
+    # Resolve upstream via router
+    router = rt.router if rt else None
+    if router is not None and router.is_available:
+        resolved = router.resolve(request.headers.get("Authorization"))
+        if resolved is not None:
+            target = resolved.target_url
+            if resolved.path_prefix:
+                path_prefix = resolved.path_prefix
+
+    body = await request.read()
+    if path_prefix and not request.path.startswith(path_prefix):
+        upstream_url = target.rstrip("/") + path_prefix + request.path
+    else:
+        upstream_url = target.rstrip("/") + request.path
+
+    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host",)}
+    from deepseek_tap_proxy.shared.headers import filter_hop_by_hop
+    fwd_headers = filter_hop_by_hop(fwd_headers)
+
+    try:
+        upstream_resp = await session.request(
+            method="POST", url=upstream_url, data=body, headers=fwd_headers,
+            timeout=aiohttp.ClientTimeout(total=getattr(rt.config, "timeout", 120) if rt and rt.config else 120),
+        )
+    except Exception as exc:
+        log.error(f"[fim] upstream error for {request.path}: {exc}")
+        return web.Response(status=502, text=str(exc))
+
+    resp_body = await upstream_resp.read()
+    return web.Response(
+        status=upstream_resp.status,
+        headers={k: v for k, v in upstream_resp.headers.items()
+                 if k.lower() not in ("transfer-encoding", "content-encoding", "content-length")},
+        body=resp_body,
+    )
 
 
 def _build_pipeline(prefix_enabled: bool = False, lock_sys_tools: bool = True) -> Pipeline:

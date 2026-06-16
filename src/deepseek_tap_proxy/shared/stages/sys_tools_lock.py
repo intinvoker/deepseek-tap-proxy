@@ -26,11 +26,12 @@ class SysToolsLockStage(Stage):
         self._default_enabled = enabled
 
     async def process(self, ctx: Context) -> Context:
-        config = ctx.request.app.get("config", {})
+        rt = ctx.request.get("runtime")
+        config = rt.config if rt else {}
         lock_enabled = getattr(config, "lock_sys_tools", self._default_enabled)
         if not lock_enabled:
             return ctx
-        if ctx.chat_type == "subagent":
+        if ctx.chat_type in ("subagent", "auto_title"):
             ctx.meta["sys_tools_locked"] = "skip"
             ctx.persist.sys_tools_locked = "skip"
             return ctx
@@ -41,7 +42,7 @@ class SysToolsLockStage(Stage):
         if ctx.client_type not in ("copilot", "copilot-agent", "claude-code"):
             return ctx
 
-        store: MemoryStore | None = ctx.request.app.get("store")
+        store: MemoryStore | None = rt.store if rt else None
         if not store:
             return ctx
 
@@ -130,4 +131,5 @@ def _schedule_canonical_init(store: MemoryStore, session_id: str,
     def _write(conn, sid, s, t):
         set_session_canonical(conn, sid, sys=s, tools=t)
 
-    store.enqueue_sqlite_write(_write, session_id, sys_json, tools_json)
+    store.enqueue_sqlite_write(_write, session_id, sys_json, tools_json,
+                               op_name="canonical_init")

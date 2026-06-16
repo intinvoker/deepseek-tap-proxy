@@ -2,6 +2,11 @@
 
 匹配 session 的前缀链，锁定 sys/tools/messages 到前缀值以最大化缓存命中。
 通过 MemoryStore 读取（0 I/O），SQLite 落盘为 fire-and-forget。
+
+匹配策略 (v2, 2026-06-12):
+  - messages 段: 先提取 stable prefix（倒数第二个 user 之前），再双向匹配
+  - sys/tools 段: 全量位置化匹配（SysToolsLock 已保证稳定）
+  - 锁定: chain[:fc] + curr[fc:n-bc] + chain[n-bc:] + current_round
 """
 from __future__ import annotations
 
@@ -40,7 +45,8 @@ class PrefixLockStage(Stage):
         if not all_msgs_c:
             return ctx
 
-        store: MemoryStore | None = ctx.request.app.get("store")
+        rt = ctx.request.get("runtime")
+        store: MemoryStore | None = rt.store if rt else None
         if not store:
             return ctx
 
@@ -56,26 +62,31 @@ class PrefixLockStage(Stage):
             return ctx
 
         from deepseek_tap_proxy.shared.match import match_prefix
+        from deepseek_tap_proxy.shared.boundary import extract_stable_prefix
+
+        # ── 提取 stable prefix（对 compaction/subagent 不做边界提取） ──
+        if ctx.chat_type == "normal":
+            msgs_boundary = extract_stable_prefix(msgs_c)
+        else:
+            msgs_boundary = len(msgs_c)  # compaction/subagent: 全量匹配
+
+        stable_msgs = msgs_c[:msgs_boundary]
+        curr_round_msgs = msgs_c[msgs_boundary:]
+        stable_hashes = ctx.messages_hashes[:msgs_boundary]
 
         # ── 三段独立匹配 ──
-        _user_positions = [
-            i for i, m in enumerate(msgs_c)
-            if isinstance(m, dict) and m.get("role") == "user"
-        ]
-        _disable_ua = ctx.chat_type == "compaction"
 
-        def _match_segment(hashes_key: str, curr_hashes: list[str],
-                           user_pos: list[int], disable_ua: bool):
+        def _match_segment(hashes_key: str, curr_hashes: list[str]):
             if not curr_hashes:
                 return None
             return match_prefix(
                 [chain_hash_view(c, hashes_key) for c in chains],
-                curr_hashes, user_pos, disable_user_anchor=disable_ua,
+                curr_hashes,
             )
 
-        msg_result = _match_segment("messages_hashes", ctx.messages_hashes, _user_positions, _disable_ua)
-        sys_result = _match_segment("sys_hashes", ctx.sys_hashes, [], True)
-        tools_result = _match_segment("tools_hashes", ctx.tools_hashes, [], True)
+        msg_result = _match_segment("messages_hashes", stable_hashes)  # ← only stable
+        sys_result = _match_segment("sys_hashes", ctx.sys_hashes)
+        tools_result = _match_segment("tools_hashes", ctx.tools_hashes)
 
         if msg_result is None:
             create_chain(ctx, all_msgs_c, hit_count=0)
@@ -94,9 +105,15 @@ class PrefixLockStage(Stage):
         msg_p = json_list(best_chain.get("messages"))
         all_msgs_p = sys_p + tools_p + msg_p
 
-        msgs_n = msg_result.n if msg_result else -1
-        sys_n = sys_best.n if sys_best else -1
-        tools_n = tools_best.n if tools_best else -1
+        # ── 双向匹配结果 ──
+        msg_fc = msg_result.fc
+        msg_bc = msg_result.bc
+        sys_fc = sys_best.fc if sys_best else 0
+        tools_fc = tools_best.fc if tools_best else 0
+
+        # 兼容旧接口：n = fc - 1（用于 sys/tools 锁定）
+        sys_n = sys_fc - 1 if sys_fc > 0 else -1
+        tools_n = tools_fc - 1 if tools_fc > 0 else -1
 
         msgs_lock = msg_result.lock_type if msg_result else "none"
         sys_lock = sys_best.lock_type if sys_best else "none"
@@ -109,7 +126,7 @@ class PrefixLockStage(Stage):
 
         eff_sys = _effective_lock(sys_lock, len(sys_c), len(sys_p))
         eff_tools = _effective_lock(tools_lock, len(tools_c), len(tools_p))
-        eff_msgs = _effective_lock(msgs_lock if msg_result else "none", len(msgs_c), len(msg_p))
+        eff_msgs = _effective_lock(msgs_lock if msg_result else "none", len(stable_msgs), len(msg_p))
 
         if eff_sys == "layer1_perfect" and eff_tools == "layer1_perfect" and eff_msgs == "layer1_perfect":
             lock_type = "layer1_perfect"
@@ -118,16 +135,28 @@ class PrefixLockStage(Stage):
         else:
             lock_type = "none"
 
-        locked_sys = sys_p[:sys_n + 1] + sys_c[sys_n + 1:] if sys_n >= 0 else sys_c
-        locked_tools = tools_p[:tools_n + 1] + tools_c[tools_n + 1:] if tools_n >= 0 else tools_c
-        locked_msgs = msg_p[:msgs_n + 1] + msgs_c[msgs_n + 1:] if msgs_n >= 0 else msgs_c
+        # ── 三段锁定 ──
+        # sys: chain[:sys_fc] + curr[sys_fc:]
+        locked_sys = sys_p[:sys_fc] + sys_c[sys_fc:] if sys_fc > 0 else sys_c
+        # tools: chain[:tools_fc] + curr[tools_fc:]
+        locked_tools = tools_p[:tools_fc] + tools_c[tools_fc:] if tools_fc > 0 else tools_c
+
+        # messages: chain[:fc] + stable[fc:n-bc] + chain[n-bc:] + current_round
+        n = min(len(msg_p), len(stable_hashes))
+        locked_msgs = list(msg_p[:msg_fc])  # front matched from chain
+        if msg_fc < n - msg_bc:
+            locked_msgs.extend(stable_msgs[msg_fc:n - msg_bc])  # middle from curr
+        if msg_bc > 0:
+            locked_msgs.extend(msg_p[n - msg_bc:n])  # back matched from chain
+        if n < len(stable_msgs):
+            locked_msgs.extend(stable_msgs[n:])  # extra stable beyond chain (from curr)
+        locked_msgs.extend(curr_round_msgs)  # current round unconditionally
 
         # 防御性验证仅对 messages 段（tool_call 边界）
         from deepseek_tap_proxy.shared.prefix import (
             compute_safe_breakpoints, find_safe_truncation, validate_tool_call_chain,
         )
-        msgs_n_original = msgs_n
-        if not validate_tool_call_chain(locked_msgs):
+        if msg_bc > 0 and not validate_tool_call_chain(locked_msgs):
             safe_bps = None
             if best_chain.get("safe_breakpoints"):
                 try:
@@ -136,22 +165,35 @@ class PrefixLockStage(Stage):
                     safe_bps = None
             if safe_bps is None:
                 safe_bps = compute_safe_breakpoints(msg_p)
-            msgs_n = find_safe_truncation(safe_bps, msgs_n)
-            locked_msgs = msg_p[:msgs_n + 1] + msgs_c[msgs_n + 1:]
-            log.warning(
-                f"[{ctx.req_id}] msgs_n corrected for tool_call boundary: "
-                f"{msgs_n_original}→{msgs_n}"
-            )
+            # 后向匹配可能跨 tool_call 边界，用 safe_breakpoints 修正
+            safe_trunc = find_safe_truncation(safe_bps, n - msg_bc)
+            if safe_trunc < n - msg_bc:
+                # 回退后向匹配到安全边界
+                adjusted_bc = n - safe_trunc
+                locked_msgs = list(msg_p[:msg_fc])
+                if msg_fc < n - adjusted_bc:
+                    locked_msgs.extend(stable_msgs[msg_fc:n - adjusted_bc])
+                if adjusted_bc > 0:
+                    locked_msgs.extend(msg_p[n - adjusted_bc:n])
+                if n < len(stable_msgs):
+                    locked_msgs.extend(stable_msgs[n:])
+                locked_msgs.extend(curr_round_msgs)
+                log.warning(
+                    f"[{ctx.req_id}] back_match corrected for tool_call boundary: "
+                    f"{msg_bc}→{adjusted_bc}"
+                )
+                msg_bc = adjusted_bc
 
         if lock_type != "layer1_perfect":
             ctx.persist.is_modified = True
         ctx.meta["log_msgs_after"] = len(locked_sys) + len(locked_tools) + len(locked_msgs)
 
-        total_hit = max(0, sys_n + 1) + max(0, tools_n + 1) + max(0, msgs_n + 1)
+        # ── Hit count：fc + bc（而非旧 n+1） ──
+        total_hit = msg_fc + msg_bc
         ctx.meta["pref_hit_count"] = total_hit
-        ctx.meta["pref_sys_hit"] = max(0, sys_n + 1)
-        ctx.meta["pref_tools_hit"] = max(0, tools_n + 1)
-        ctx.meta["pref_msgs_hit"] = max(0, msgs_n + 1)
+        ctx.meta["pref_sys_hit"] = sys_fc
+        ctx.meta["pref_tools_hit"] = tools_fc
+        ctx.meta["pref_msgs_hit"] = msg_fc
 
         # est 数据 — from MemoryStore (0 I/O)
         pref_hit = total_hit
@@ -181,10 +223,14 @@ class PrefixLockStage(Stage):
                 _p_tools = _prefix_context[len(sys_p):len(sys_p) + len(tools_p)]
                 _p_msgs = _prefix_context[len(sys_p) + len(tools_p):]
 
+                # 旧版 hash 截断：sys_n / tools_n 仍保留为 fc-1
+                _sys_n = sys_fc - 1 if sys_fc > 0 else -1
+                _tools_n = tools_fc - 1 if tools_fc > 0 else -1
+
                 _prefix_hashes = (
-                    best_chain["sys_hashes"].split(",")[:sys_n + 1] +
-                    best_chain["tools_hashes"].split(",")[:tools_n + 1] +
-                    best_chain["messages_hashes"].split(",")[:msgs_n + 1]
+                    best_chain["sys_hashes"].split(",")[:_sys_n + 1] +
+                    best_chain["tools_hashes"].split(",")[:_tools_n + 1] +
+                    best_chain["messages_hashes"].split(",")[:msg_fc]
                 )
                 _prefix_chain_id = make_chain_id(_prefix_hashes)
 
@@ -193,9 +239,9 @@ class PrefixLockStage(Stage):
                     ctx.session_id, _prefix_chain_id,
                     sys=json.dumps(_p_sys), tools=json.dumps(_p_tools),
                     messages=json.dumps(_p_msgs),
-                    sys_hashes=",".join(best_chain["sys_hashes"].split(",")[:sys_n + 1]),
-                    tools_hashes=",".join(best_chain["tools_hashes"].split(",")[:tools_n + 1]),
-                    messages_hashes=",".join(best_chain["messages_hashes"].split(",")[:msgs_n + 1]),
+                    sys_hashes=",".join(best_chain["sys_hashes"].split(",")[:_sys_n + 1]),
+                    tools_hashes=",".join(best_chain["tools_hashes"].split(",")[:_tools_n + 1]),
+                    messages_hashes=",".join(best_chain["messages_hashes"].split(",")[:msg_fc]),
                     msg_count=pref_hit, safe_breakpoints=_bps(_prefix_context), is_frozen=True,
                     family_key=ctx.family_key,
                 )
@@ -205,14 +251,14 @@ class PrefixLockStage(Stage):
                 _schedule_chain_persist(store, ctx.session_id, _prefix_chain_id,
                                         json.dumps(_p_sys), json.dumps(_p_tools),
                                         json.dumps(_p_msgs),
-                                        ",".join(best_chain["sys_hashes"].split(",")[:sys_n + 1]),
-                                        ",".join(best_chain["tools_hashes"].split(",")[:tools_n + 1]),
-                                        ",".join(best_chain["messages_hashes"].split(",")[:msgs_n + 1]),
+                                        ",".join(best_chain["sys_hashes"].split(",")[:_sys_n + 1]),
+                                        ",".join(best_chain["tools_hashes"].split(",")[:_tools_n + 1]),
+                                        ",".join(best_chain["messages_hashes"].split(",")[:msg_fc]),
                                         pref_hit, _bps(_prefix_context), True,
                                         _prefix_chain_id, pref_hit, prefix_tokens_est, _prefix_cc)
 
                 print(green(f"  [chain] + prefix: {_prefix_chain_id[:16]}... "
-                            f"(s={sys_n + 1} t={tools_n + 1} m={msgs_n + 1}, frozen, est={prefix_tokens_est}t)"))
+                            f"(s={sys_fc} t={tools_fc} m={msg_fc}, frozen, est={prefix_tokens_est}t)"))
 
                 chain_tokens = prefix_tokens_est
                 chain_char_count = _prefix_cc
@@ -233,15 +279,13 @@ class PrefixLockStage(Stage):
         ctx.messages = locked_msgs
 
         ctx.persist.lock_type = lock_type
-        correction_note = ""
-        if msgs_n != msgs_n_original:
-            correction_note = f" msgs_n_corrected: {msgs_n_original}→{msgs_n}"
         prefix_note = (
             f"{lock_type}: "
-            f"sys_n={sys_n}, tools_n={tools_n}, msgs_n={msgs_n}, "
+            f"sys_fc={sys_fc}, tools_fc={tools_fc}, "
+            f"msg_fc={msg_fc}, msg_bc={msg_bc}, "
             f"prefix=({len(sys_p)},{len(tools_p)},{len(msg_p)}), "
             f"curr=({len(sys_c)},{len(tools_c)},{len(msgs_c)})"
-            + correction_note
+            + (f" boundary={msgs_boundary}" if msgs_boundary < len(msgs_c) else "")
         )
         existing = ctx.persist.modification_note or ""
         ctx.persist.modification_note = (
@@ -260,7 +304,7 @@ class PrefixLockStage(Stage):
                 sys_hashes=ctx.sys_hash_chain, tools_hashes=ctx.tools_hash_chain,
                 messages_hashes=ctx.messages_hash_chain,
                 sys=ctx.sys, tools=ctx.tools, messages=ctx.messages,
-                hit_count=total_hit, sys_hit=max(0, sys_n + 1), tools_hit=max(0, tools_n + 1),
+                hit_count=total_hit, sys_hit=sys_fc, tools_hit=tools_fc,
                 chain_tokens=chain_tokens, char_count=cc,
             )
         else:
@@ -303,4 +347,5 @@ def _schedule_chain_persist(store: MemoryStore, session_id: str, chain_id: str,
         sys_hashes, tools_hashes, messages_hashes,
         msg_count, safe_breakpoints, is_frozen,
         cth_chain_id, cth_msg_count, cth_tokens, cth_char_count,
+        op_name="prefix_persist",
     )

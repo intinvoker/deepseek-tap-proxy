@@ -76,3 +76,6 @@ class PersistRecord:
 
     # ── Anthropic 专属（始终可选） ──
     trace_category: str = ""
+
+    # ── 请求分类 ──
+    topic: str = ""                  # "chat" | "count_tokens" | "passthrough" | "rejected" | ""

@@ -1,10 +1,17 @@
-"""前缀链匹配引擎。
+"""前缀链匹配引擎 — 双向位置化匹配。
 
-为当前请求的 hash 链在已有前缀链中定位最佳匹配。
-封装全部匹配逻辑（判定 + 边界索引），PrefixLockStage 只负责执行锁定。
+为当前请求的 **稳定前缀** hash 链在已有前缀链中定位最佳匹配。
+封装全部匹配逻辑，PrefixLockStage 只负责执行锁定。
 
-性能：O(N + K×M)，其中 N = curr 长度，M = 链长度，K = 链数量。
-链数量通常 ≤3，总体 < 150 元素，开销可忽略。
+匹配策略（双向）:
+  1. 前向: 从位置 0 开始逐位置比较，遇不同即停 → fc
+  2. 后向: 从末尾往 fc 方向逐位置比较，遇不同即停 → bc
+  3. 判定: 前后各达到阈值 + 总占比达到阈值 → 确认同一链
+  4. 锁定: chain[:fc] + curr[fc:n-bc] + chain[n-bc:] + 当前轮
+
+对比旧版贪心扫描（_scan_chain）:
+  - ❌ hash 存在性匹配 (跨位置跳跃 → NewRound 被替换)
+  - ✅ 位置化匹配 (同索引严格相等 → NewRound 完整保留)
 """
 
 from __future__ import annotations
@@ -15,134 +22,137 @@ class MatchResult(NamedTuple):
     """匹配结果。
 
     chain_id:   匹配到的链 ID
-    n:          链中最后一个能匹配到 curr 旧内容的索引 (0-based)
-                锁定 = chain[:n+1] + curr[n+1:]
-    lock_type:  "layer1_perfect" | "layer2_partial" | "none"
+    fc:         前向匹配条数（0-based count，从位置 0 开始有几条匹配）
+    bc:         后向匹配条数（0-based count，从末尾向前有几条匹配）
+                锁定: chain[:fc] + curr[fc:n-bc] + chain[n-bc:]
+    lock_type:  "layer1_perfect" | "layer2_partial"
     """
+
     chain_id: str
-    n: int
+    fc: int
+    bc: int
     lock_type: str
 
 
-def _compute_boundary(curr_len: int, user_positions: list[int],
-                      *, disable_user_anchor: bool = False) -> int:
-    """确定旧内容边界（搜索上限）。
-
-    ≥2 user 且未禁用锚点时：保护最后一个 user 及之后 = msg_new。
-    禁用锚点时（compaction / 首轮 / 子代理）：回退到全量。
-    """
-    if not disable_user_anchor and len(user_positions) >= 2:
-        b = user_positions[-1] - 1
-        if b >= 0:
-            return b
-    return curr_len - 1
+# ── 内部匹配函数 ──────────────────────────────────────────
 
 
-def _build_lookup(hashes: list[str], boundary: int) -> dict[str, list[int]]:
-    """构建 hash → 所有出现位置 的查找表（递增有序）。
-
-    只索引 boundary 及之前的位置（旧内容区域）。
-    存所有位置支持同一 hash 多次出现时的顺序匹配。
-    """
-    import bisect
-    lookup: dict[str, list[int]] = {}
-    for i in range(boundary + 1):
-        h = hashes[i]
-        lookup.setdefault(h, []).append(i)
-    return lookup
-
-
-def _find_pos(lookup: dict[str, list[int]], h: str, curr_ptr: int) -> int | None:
-    """在 lookup 中找 h 的第一个 ≥ curr_ptr 的位置。O(log K) 其中 K 是 h 的出现次数。"""
-    positions = lookup.get(h)
-    if not positions:
-        return None
-    # 二分查找
-    import bisect
-    idx = bisect.bisect_left(positions, curr_ptr)
-    if idx < len(positions):
-        return positions[idx]
-    return None
-
-
-def _scan_chain(
-    chain_hashes: list[str],
-    lookup: dict[str, list[int]],
+def _match_front(
+    chain_hashes: list[str], curr_hashes: list[str], n: int
 ) -> int:
-    """贪心前向扫描：找链中最后一个能匹配到 curr 旧内容的索引。
+    """前向位置化匹配。
 
-    curr_ptr 维护"下次匹配必须在 curr 中 >= 此位置"的约束，
-    保证匹配是单调向前的（不交叉、不回退）。
-    篡改/删减的 hash 在 lookup 中不存在，自然跳过。
+    从位置 0 开始，逐位置比较 curr[i] == chain[i]，
+    遇到第一个不匹配的位置或到达 n-1 为止。
+    Returns 匹配的条数 (0..n)。
     """
-    curr_ptr = 0
-    n = -1
-
-    for chain_i, h in enumerate(chain_hashes):
-        pos = _find_pos(lookup, h, curr_ptr)
-        if pos is not None:
-            curr_ptr = pos + 1
-            n = chain_i
-
+    for i in range(n):
+        if curr_hashes[i] != chain_hashes[i]:
+            return i
     return n
+
+
+def _match_back(
+    chain_hashes: list[str], curr_hashes: list[str], n: int, fc: int
+) -> int:
+    """后向位置化匹配。
+
+    从位置 n-1 向 fc 方向（不重叠），逐位置比较 curr[i] == chain[i]，
+    遇到第一个不匹配即停。
+    Returns 匹配的条数 (0..n-fc)。
+    """
+    bc = 0
+    for i in range(n - 1, fc - 1, -1):
+        if curr_hashes[i] != chain_hashes[i]:
+            break
+        bc += 1
+    return bc
+
+
+# ── 阈值判定 ────────────────────────────────────────────
+
+_SHORT_CHAIN_THRESHOLD = 6
+
+
+def _passes_threshold(fc: int, bc: int, match_len: int) -> bool:
+    """判定是否通过双向匹配阈值。
+
+    长链 (match_len >= 6):  fc >= 3 AND bc >= 3
+    短链 (match_len < 6):   fc >= 1 AND bc >= 1
+    """
+    if match_len < _SHORT_CHAIN_THRESHOLD:
+        return fc >= 1 and bc >= 1
+    return fc >= 3 and bc >= 3
+
+
+# ── 主入口 ──────────────────────────────────────────────
 
 
 def match_prefix(
     chains: list[dict],
     curr_hashes: list[str],
-    user_positions: list[int],
-    *,
-    min_match: int = 2,
-    disable_user_anchor: bool = False,
 ) -> MatchResult | None:
     """为当前请求的 hash 链在已有前缀链中定位最佳匹配。
 
     Args:
-        chains:           get_session_chains 返回的链列表。
-        curr_hashes:      当前请求的 hash 链（完整，sys+tools+msg）。
-        user_positions:   curr 中所有 role=user 的位置索引。
-        min_match:        最少需匹配的链元素数（默认 2）。
-        disable_user_anchor: 禁用 user 锚点（compaction / 首轮 / 子代理）。
+        chains:       get_session_chains 返回的链列表。
+                      每个链需包含 ``chain_id`` 和 ``hash_chain``。
+        curr_hashes:  当前请求的**稳定前缀** hash 链
+                      （由 extract_stable_prefix 预先提取，
+                      不含当前轮的新消息）。
 
     Returns:
-        MatchResult(chain_id, n, lock_type)，或 None（无匹配 → CREATE 新链）。
+        MatchResult(chain_id, fc, bc, lock_type)，
+        或 None（无满足阈值的匹配 → 应 CREATE 新链）。
     """
     if not chains or not curr_hashes:
         return None
 
-    boundary = _compute_boundary(len(curr_hashes), user_positions,
-                                  disable_user_anchor=disable_user_anchor)
-    lookup = _build_lookup(curr_hashes, boundary)
+    n = len(curr_hashes)
 
     best: MatchResult | None = None
+    best_total = -1
 
     for chain in chains:
         chain_id = chain["chain_id"]
-        chain_hashes = chain["hash_chain"].split(",") if chain["hash_chain"] else []
+        chain_hashes_str = chain.get("hash_chain", "")
+        chain_hashes = chain_hashes_str.split(",") if chain_hashes_str else []
 
         if not chain_hashes:
             continue
 
-        # Layer 1: 完美延续 — 当前请求严格承接链的全部内容
-        if len(curr_hashes) >= len(chain_hashes) \
-           and curr_hashes[:len(chain_hashes)] == chain_hashes:
-            candidate_n = len(chain_hashes) - 1
-            if best is None or candidate_n > best.n:
-                best = MatchResult(
-                    chain_id=chain_id,
-                    n=candidate_n,
-                    lock_type="layer1_perfect",
-                )
+        match_len = min(len(chain_hashes), n)
+        if match_len == 0:
             continue
 
-        # Layer 2: 贪心前向扫描
-        n = _scan_chain(chain_hashes, lookup)
-        if n >= min_match:
-            if best is None or n > best.n:
+        # Layer 1: 完美匹配 — curr[:match_len] 与 chain[:match_len] 逐位置全等
+        if curr_hashes[:match_len] == chain_hashes[:match_len]:
+            total_matched = match_len
+            if best is None or total_matched > best_total:
                 best = MatchResult(
                     chain_id=chain_id,
-                    n=n,
-                    lock_type="layer2_partial",
+                    fc=match_len,
+                    bc=0,
+                    lock_type="layer1_perfect",
                 )
+                best_total = total_matched
+            continue
+
+        # Layer 2: 双向位置化匹配
+        fc = _match_front(chain_hashes, curr_hashes, match_len)
+        bc = _match_back(chain_hashes, curr_hashes, match_len, fc)
+
+        if not _passes_threshold(fc, bc, match_len):
+            continue
+
+        total_matched = fc + bc
+        if best is None or total_matched > best_total:
+            best = MatchResult(
+                chain_id=chain_id,
+                fc=fc,
+                bc=bc,
+                lock_type="layer2_partial",
+            )
+            best_total = total_matched
 
     return best

@@ -5,6 +5,7 @@
 #   .\run.ps1 -DisableLock                         等价
 #   .\run.ps1 -NoOtlp                              关闭 OTLP JSONL 日志
 #   .\run.ps1 -OtlpLogDir ./data/otlp-logs         自定义 OTLP 输出目录（默认写入 runs/{run_id}/{date}/）
+#   .\run.ps1 -UpstreamsConfig data/upstreams.yaml 启用多上游路由（key 前缀匹配）
 param(
     [int]$Port = 11808,
     [string]$Target = "https://api.deepseek.com",
@@ -12,7 +13,8 @@ param(
     [string]$LockMode = "prefix",
     [switch]$DisableLock,
     [switch]$NoOtlp,
-    [string]$OtlpLogDir = ""
+    [string]$OtlpLogDir = "",
+    [string]$UpstreamsConfig = "data/upstreams.yaml"
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,8 +58,12 @@ if ($NoOtlp) {
 } else {
     Write-Host "  OTLP:    runs/{run_id}/{date}/otlp.jsonl (默认)" -ForegroundColor DarkYellow
 }
+if ($UpstreamsConfig) {
+    Write-Host "  Router:  $UpstreamsConfig (key 前缀路由)" -ForegroundColor Green
+}
 Write-Host ""
 
 $otlpArg = if ($OtlpLogDir) { "--otlp-log-dir", $OtlpLogDir } else { @() }
+$upstreamsArg = if ($UpstreamsConfig) { "--upstreams-config", $UpstreamsConfig } else { @() }
 
-& $python -m deepseek_tap_proxy --port $Port --target $Target --lock-mode $lock @otlpArg
+& $python -m deepseek_tap_proxy --port $Port --target $Target --lock-mode $lock @otlpArg @upstreamsArg

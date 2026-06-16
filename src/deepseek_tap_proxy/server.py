@@ -17,6 +17,8 @@ from deepseek_tap_proxy.shared.store import MemoryStore
 from deepseek_tap_proxy.router import UpstreamRouter
 from deepseek_tap_proxy.openai.routes import setup_openai_routes
 from deepseek_tap_proxy.anthropic.routes import setup_anthropic_routes
+from deepseek_tap_proxy.shared.runtime import Runtime
+from deepseek_tap_proxy.shared.transport import AiohttpTransport
 
 log = logging.getLogger("deepseek-tap")
 
@@ -45,6 +47,9 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     writer = TraceWriter(run_dir, run_id)
     db = Database(config.db_path)
     db.init_db()
+    # Close the main-thread connection so the fire-and-forget writer thread
+    # (started by MemoryStore.__init__) does not hit "database is locked".
+    db.close()
 
     # MemoryStore: load existing data from SQLite into in-memory store (0 I/O runtime)
     store = await MemoryStore.load_from(db, _db=db)
@@ -64,20 +69,34 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     app["proxy_ctx"] = {
         "writer": writer,
         "session": client_session,
-        "target_url": config.target,
-        "timeout": config.timeout,
-        "session_id": run_id,
         "run_id": run_id,
         "run_dir": run_dir,
-        "router": router,
         "otlp_log_writer": otlp_writer,
-        "store": store,           # ← MemoryStore (0 I/O runtime reads)
     }
-    app["store"] = store
     app["db"] = db
-    app["db_conn"] = db.conn
-    app["config"] = config
     app["writer"] = writer
+
+    # 🆕 构造 Runtime（强类型依赖注入）
+    runtime = Runtime(
+        store=store,
+        config=config,
+        transport=AiohttpTransport(client_session, config.timeout),
+        session=client_session,
+        router=router,
+        run_id=run_id,
+        otlp_writer=otlp_writer,
+    )
+
+    # 🆕 Middleware: 对每个请求注入 Runtime + upstream
+    @web.middleware
+    async def runtime_middleware(request: web.Request, handler):
+        request["runtime"] = runtime
+        # Resolve upstream for this request
+        resolved = await _resolve_upstream_for_request(request)
+        request["upstream"] = resolved
+        return await handler(request)
+
+    app.middlewares.append(runtime_middleware)
 
     setup_openai_routes(app)
     from deepseek_tap_proxy.anthropic.handler import setup_anthropic_pipelines
@@ -132,36 +151,40 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
 async def _resolve_upstream_for_request(request: web.Request):
     """Resolve upstream for GET passthrough requests (no pipeline)."""
     from deepseek_tap_proxy.router import ResolvedTarget
-    proxy_ctx = request.app.get("proxy_ctx", {})
-    router = proxy_ctx.get("router")
+    rt = request.get("runtime")
+    router = rt.router if rt else None
     if router is not None and router.is_available:
         resolved = router.resolve(request.headers.get("Authorization"))
         if resolved is not None:
             return resolved
     return ResolvedTarget(
-        target_url=proxy_ctx.get("target_url", ""),
+        target_url=getattr(rt.config, "target", "") if rt and rt.config else "",
         upstream_name="default",
         matched_key_prefix=None,
     )
 
 
 async def _proxy_get_handler(request: web.Request) -> web.Response:
-    proxy_ctx = request.app["proxy_ctx"]
-    session: aiohttp.ClientSession = proxy_ctx["session"]
+    rt = request.get("runtime")
+    session: aiohttp.ClientSession = rt.session if rt else request.app.get("proxy_ctx", {}).get("session")
 
     # Read resolved upstream from request (set by wrapper)
     upstream = request.get("upstream")
     if upstream is not None:
         target = upstream.target_url
     else:
-        target = proxy_ctx.get("target_url", "")
+        target = getattr(rt.config, "target", "") if rt and rt.config else ""
 
     log.debug(f"[upstream] GET {request.path} → {upstream.upstream_name if upstream else 'default'}")
 
     fwd_headers = dict(request.headers)
     fwd_headers.pop("Host", None)
     fwd_headers = filter_hop_by_hop(fwd_headers)
-    upstream_url = target.rstrip("/") + request.path
+    path_prefix = upstream.path_prefix if upstream is not None and upstream.path_prefix else ""
+    if path_prefix and not request.path.startswith(path_prefix):
+        upstream_url = target.rstrip("/") + path_prefix + request.path
+    else:
+        upstream_url = target.rstrip("/") + request.path
 
     try:
         upstream_resp = await session.request(
@@ -184,7 +207,17 @@ async def _proxy_get_handler(request: web.Request) -> web.Response:
 
 
 async def _health_handler(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "proxy"})
+    rt = request.get("runtime")
+    store = rt.store if rt else request.app.get("store")
+    result = {"status": "ok", "service": "proxy"}
+    if store:
+        stats = store.get_write_stats()
+        result["write_stats"] = stats
+        if stats["writes_failed"] > 10:
+            result["status"] = "degraded"
+        if stats["writes_attempted"] > 100 and stats["failure_rate"] > 0.05:
+            result["status"] = "degraded"
+    return web.json_response(result)
 
 
 async def _close_writer(writer: TraceWriter) -> None:
