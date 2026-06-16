@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from deepseek_tap_proxy.pipeline.chain_action import ChainAction
+from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
 
 
 def compute_char_count(messages: list[dict]) -> int:
@@ -27,11 +29,25 @@ def json_list(raw) -> list[dict]:
         return []
 
 
-def chain_hash_view(chain: dict, hashes_key: str) -> dict:
-    """Wrap a chain dict as a match_prefix-compatible view for a single segment."""
+def chain_hash_view(chain, hashes_key: str, store=None) -> dict:
+    """Wrap a chain (Chain object or dict) as a match_prefix-compatible view.
+
+    Supports both ``Chain`` dataclass objects (attribute access) and
+    plain dicts (bracket/key access) for backward compatibility.
+
+    ``store`` is a MemoryStore (optional — currently unused, provided
+    for future signature compatibility).
+    """
+    if isinstance(chain, dict):
+        return {
+            "chain_id": chain["chain_id"],
+            "hash_chain": chain.get(hashes_key, ""),
+        }
+    # Chain dataclass — hash data via attributes
+    hash_chain = getattr(chain, hashes_key, "")
     return {
-        "chain_id": chain["chain_id"],
-        "hash_chain": chain.get(hashes_key, ""),
+        "chain_id": chain.chain_id,
+        "hash_chain": hash_chain,
     }
 
 
@@ -88,7 +104,7 @@ def persist_chain_nowait(ctx, _db=None) -> None:
     if not (ca and ca.action in ("create", "update") and session_id and ctx.chat_type != "compaction"):
         return
 
-    from deepseek_tap_proxy.shared.db import upsert_prefix_chain, insert_chain_token
+    from deepseek_tap_proxy.shared.db import upsert_prefix_chain
     from deepseek_tap_proxy.shared.colors import green
     from deepseek_tap_proxy.shared.store import MemoryStore
 
@@ -112,25 +128,22 @@ def persist_chain_nowait(ctx, _db=None) -> None:
             sys_hashes=sys_hashes, tools_hashes=tools_hashes,
             messages_hashes=msgs_hashes,
             msg_count=msg_cnt, safe_breakpoints=ca.safe_breakpoints,
-            is_frozen=ca.is_frozen,
+            is_frozen=False,
             family_key=ctx.family_key,
         )
-        store.insert_chain_token(ca.chain_id, msg_cnt, chain_tokens, ca.char_count)
 
     # 2. Fire-and-forget SQLite write (durability)
     if store:
-        def _write(conn, sid, cid, s, t, m, sh, th, mh, mc, sb, frz, tcid, tm, ttk, tcc):
+        def _write(conn, sid, cid, s, t, m, sh, th, mh, mc, sb, frz):
             upsert_prefix_chain(conn, sid, cid, sys=s, tools=t, messages=m,
                                sys_hashes=sh, tools_hashes=th, messages_hashes=mh,
                                msg_count=mc, safe_breakpoints=sb, is_frozen=frz)
-            insert_chain_token(conn, tcid, msg_count=tm, tokens=ttk, char_count=tcc)
 
         store.enqueue_sqlite_write(
             _write, session_id, ca.chain_id,
             sys_json, tools_json, msgs_json,
             sys_hashes, tools_hashes, msgs_hashes,
-            msg_cnt, ca.safe_breakpoints, ca.is_frozen,
-            ca.chain_id, msg_cnt, chain_tokens, ca.char_count,
+            msg_cnt, ca.safe_breakpoints, False,
             op_name="chain_persist",
         )
 
@@ -142,3 +155,105 @@ def persist_chain_nowait(ctx, _db=None) -> None:
         f"  [chain] {tag}: {ca.chain_id[:16]}... "
         f"(s={s_len} t={t_len} m={m_len}, hit={ca.hit_count})"
     ))
+
+
+def create_chain_moment(ctx, store) -> None:
+    """Create a ChainMoment after pipeline completes and persist it.
+
+    Determines op from chat_type (compaction) or chain_action, then
+    appends the moment to the matched chain (if available) or to a new
+    chain via ``_ensure_chain_exists``.
+
+    For compaction requests, ``persist_chain_nowait`` is skipped, so
+    the chain is created here via ``_ensure_chain_exists``.
+    """
+    if ctx.body_readonly is None:
+        return
+
+    op = "compact" if ctx.chat_type == "compaction" else (
+        ctx.chain_action.action if ctx.chain_action else "create"
+    )
+    moment = ChainMoment(
+        messages_count=len(ctx.sys) + len(ctx.tools) + len(ctx.messages),
+        op=op,
+        total_tokens=ctx.persist.total_input_tokens or 0,
+        cache_hit_tokens=ctx.persist.cache_hit_tokens or 0,
+        cache_miss_tokens=ctx.persist.cache_miss_tokens or 0,
+        char_count=compute_char_count(ctx.sys + ctx.tools + ctx.messages),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+    # Append to matched_chain's moments list for future anchor lookups
+    if isinstance(ctx.matched_chain, Chain) and op in ("update", "compact"):
+        ctx.matched_chain.moments.append(moment)
+
+    # Persist moment via store
+    chain_id = None
+    if isinstance(ctx.matched_chain, Chain):
+        chain_id = ctx.matched_chain.chain_id
+    elif isinstance(ctx.matched_chain, dict):
+        chain_id = ctx.matched_chain.get("chain_id")
+    if not chain_id and ctx.chain_action:
+        chain_id = ctx.chain_action.chain_id
+
+    if not chain_id:
+        return
+
+    # Ensure chain exists in store before adding moment.
+    # For normal requests, persist_chain_nowait already created the chain.
+    # For compaction requests, persist_chain_nowait is skipped (chat_type != "compaction"
+    # guard), so we create the chain here.
+    _ensure_chain_exists(ctx, store, chain_id)
+
+    store.add_moment(chain_id, moment)
+
+
+def _ensure_chain_exists(ctx, store, chain_id: str) -> None:
+    """Ensure a chain record exists in the store, creating it if needed.
+
+    Handles both in-memory (0 I/O) and SQLite durability.
+    ``store.upsert_chain`` is idempotent — it only overwrites when
+    ``msg_count`` is strictly greater.
+
+    For compaction requests, ``persist_chain_nowait`` is skipped
+    (chat_type guard), so this function ensures the chain is persisted.
+    """
+    import json
+
+    chain_record = store.get_chain_record(chain_id)
+    if chain_record:
+        return  # Already exists in memory
+
+    sys_json = json.dumps(ctx.sys, ensure_ascii=False)
+    tools_json = json.dumps(ctx.tools, ensure_ascii=False)
+    msgs_json = json.dumps(ctx.messages, ensure_ascii=False)
+    sys_hashes = ctx.sys_hash_chain
+    tools_hashes = ctx.tools_hash_chain
+    msgs_hashes = ctx.messages_hash_chain
+    msg_cnt = len(ctx.sys) + len(ctx.tools) + len(ctx.messages)
+
+    # 1. In-memory write (0 I/O)
+    store.upsert_chain(
+        ctx.session_id or "", chain_id,
+        sys=sys_json, tools=tools_json, messages=msgs_json,
+        sys_hashes=sys_hashes, tools_hashes=tools_hashes,
+        messages_hashes=msgs_hashes,
+        msg_count=msg_cnt,
+        family_key=ctx.family_key,
+    )
+
+    # 2. Fire-and-forget SQLite write (durability)
+    from deepseek_tap_proxy.shared.db import upsert_prefix_chain
+
+    def _write(conn, sid, cid, s, t, m, sh, th, mh, mc):
+        upsert_prefix_chain(conn, sid, cid, sys=s, tools=t, messages=m,
+                           sys_hashes=sh, tools_hashes=th, messages_hashes=mh,
+                           msg_count=mc)
+
+    store.enqueue_sqlite_write(
+        _write, ctx.session_id or "", chain_id,
+        sys_json, tools_json, msgs_json,
+        sys_hashes, tools_hashes, msgs_hashes,
+        msg_cnt,
+        op_name="chain_persist",
+    )

@@ -20,6 +20,7 @@ import xxhash
 from aiohttp import web
 from typing import Optional
 
+from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
 from deepseek_tap_proxy.shared.persist import PersistRecord
 from deepseek_tap_proxy.shared.hash import msg_hash
 from deepseek_tap_proxy.pipeline.chain_action import ChainAction
@@ -79,6 +80,11 @@ class Context:
 
     # ── 分支族标识（sys_hashes + tools_hashes → streaming xxh3_64）──
     family_key: str = ""
+
+    # ── 链匹配结果（PrefixLockStage 设置）──
+    matched_chain: Chain | None = None
+    anchor_moment: ChainMoment | None = None
+    new_char_count: int = 0
 
     # ── 内部：是否已激活 view ──
     _view_activated: bool = False

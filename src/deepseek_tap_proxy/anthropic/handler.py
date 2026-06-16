@@ -94,7 +94,7 @@ from deepseek_tap_proxy.shared.consumers import store_phase1, run_consumers
 from deepseek_tap_proxy.shared.stages import (
     CanonicalStage, SysToolsLockStage, RequestAnalysisStage,
 )
-from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait
+from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait, create_chain_moment
 from deepseek_tap_proxy.anthropic.stages import (
     AnthropicParseStage, AnthropicBlock0ClearStage,
     AnthropicSystemRoleConvertStage,
@@ -216,6 +216,10 @@ async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
         ctx.persist.model = (ctx.body_readonly or {}).get("model", "")
         ctx.persist.stream_mode = ctx.is_streaming
     store_phase1(ctx, store)
+
+    # ── Handler Moment creation (after pipeline, before run_consumers) ──
+    if store and ctx.body_readonly is not None:
+        create_chain_moment(ctx, store)
 
     # ── 5. Phase 2 落盘（管道后，JSONL + DB + log）──
     await run_consumers(

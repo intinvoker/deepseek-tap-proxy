@@ -21,4 +21,3 @@ class ChainAction:
     tools_hit: int = 0
     chain_tokens: int | None = None
     char_count: int = 0                       # canonical 消息的字符总数
-    is_frozen: bool = False                   # 公共前缀链（冻结，不 UPDATE）

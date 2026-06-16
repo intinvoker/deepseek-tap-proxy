@@ -2,7 +2,8 @@
 
 Pipeline: ParseStage → CanonicalStage → RequestAnalysisStage
           → SysToolsLockStage(opt) → PrefixLockStage(opt)
-          → CompactionRewrite → ForwardStage → ReturnStage
+          → CompactionLockStage → CompactionRewrite
+          → ForwardStage → ReturnStage
 
 Persist 统一走 MemoryStore 单写者队列（v7 架构），
 与 Anthropic handler 对称。
@@ -17,6 +18,7 @@ from aiohttp import web
 from deepseek_tap_proxy.pipeline import Context, Pipeline
 from deepseek_tap_proxy.router import ResolvedTarget
 from deepseek_tap_proxy.openai.copilot.compression import CompactionRewrite
+from deepseek_tap_proxy.shared.stages.compaction_lock import CompactionLockStage
 from deepseek_tap_proxy.openai.stages import (
     ParseStage, ForwardStage, ReturnStage,
 )
@@ -25,7 +27,7 @@ from deepseek_tap_proxy.shared.stages import (
     SysToolsLockStage, PrefixLockStage,
 )
 from deepseek_tap_proxy.shared.consumers import run_consumers
-from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait
+from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait, create_chain_moment
 
 log: logging.Logger = logging.getLogger("deepseek-tap")
 
@@ -87,6 +89,9 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
 
         # Phase 1: fire-and-forget insert (state='pending')
         store.enqueue_request_phase1(ctx)
+
+        # ── Handler Moment creation (after pipeline, before run_consumers) ──
+        create_chain_moment(ctx, store)
 
         await run_consumers(
             ctx,
@@ -161,7 +166,9 @@ def _build_pipeline(prefix_enabled: bool = False, lock_sys_tools: bool = True) -
         stages.append(SysToolsLockStage())
     if prefix_enabled:
         stages.append(PrefixLockStage())
-    # CompactionRewrite 在锁阶段之后执行，确保不会被 PrefixLock 覆盖
+    # CompactionLockStage: strip wrapping → cross-align → restore head → lock
+    stages.append(CompactionLockStage())
+    # CompactionRewrite: replace tail after head is restored
     stages.append(CompactionRewrite())
     stages.append(ForwardStage())
     stages.append(ReturnStage())

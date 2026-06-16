@@ -25,12 +25,10 @@ class CompactionRewrite(Stage):
             return ctx
         if not ctx.fwd_body or "messages" not in ctx.fwd_body:
             return ctx
-
-        log.info("[%s] rewriting compaction request to background format", ctx.req_id)
+        log.info("[%s] rewriting compaction request tail", ctx.req_id)
         msgs = list(ctx.fwd_body["messages"])
         msgs[-1] = {"role": "user", "content": SUMMARIZATION_USER_MSG}
         ctx.fwd_body["messages"] = msgs
         ctx.persist.is_modified = True
         ctx.meta["is_compaction_rewritten"] = True
-        ctx.meta["modification_note"] = "compaction: foreground->background"
         return ctx

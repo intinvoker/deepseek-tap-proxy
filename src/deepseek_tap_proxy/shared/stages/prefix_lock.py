@@ -10,14 +10,15 @@
 """
 from __future__ import annotations
 
-import json
 import logging
 
 from deepseek_tap_proxy.pipeline import Stage, Context, ChainAction
+from deepseek_tap_proxy.shared.chain import Chain
 from deepseek_tap_proxy.shared.store import MemoryStore
 from deepseek_tap_proxy.shared.stages.helpers import (
     compute_char_count, json_list, chain_hash_view, find_chain_result, create_chain,
 )
+from deepseek_tap_proxy.shared.stages.compaction_lock import _find_anchor
 
 log = logging.getLogger("deepseek-tap")
 
@@ -35,6 +36,9 @@ class PrefixLockStage(Stage):
     async def process(self, ctx: Context) -> Context:
         if not self.enabled:
             return ctx
+
+        if ctx.chat_type == "compaction":
+            return ctx  # CompactionLockStage handles chain matching downstream
 
         session_id = ctx.session_id
         if not session_id:
@@ -80,7 +84,7 @@ class PrefixLockStage(Stage):
             if not curr_hashes:
                 return None
             return match_prefix(
-                [chain_hash_view(c, hashes_key) for c in chains],
+                [chain_hash_view(c, hashes_key, store) for c in chains],
                 curr_hashes,
             )
 
@@ -93,16 +97,16 @@ class PrefixLockStage(Stage):
             return ctx
 
         best_chain_id = msg_result.chain_id
-        best_chain = next(c for c in chains if c["chain_id"] == best_chain_id)
-        ctx.persist.prefix_chain_id = best_chain["chain_id"]
-        ctx.meta["prefix_chain_msg_count"] = best_chain["msg_count"]
+        best_chain: Chain = next(c for c in chains if c.chain_id == best_chain_id)
+        ctx.persist.prefix_chain_id = best_chain.chain_id
+        ctx.meta["prefix_chain_msg_count"] = len(best_chain.sys) + len(best_chain.tools) + len(best_chain.messages)
 
         sys_best = find_chain_result(sys_result, best_chain_id)
         tools_best = find_chain_result(tools_result, best_chain_id)
 
-        sys_p = json_list(best_chain.get("sys"))
-        tools_p = json_list(best_chain.get("tools"))
-        msg_p = json_list(best_chain.get("messages"))
+        sys_p = best_chain.sys
+        tools_p = best_chain.tools
+        msg_p = best_chain.messages
         all_msgs_p = sys_p + tools_p + msg_p
 
         # ── 双向匹配结果 ──
@@ -157,14 +161,7 @@ class PrefixLockStage(Stage):
             compute_safe_breakpoints, find_safe_truncation, validate_tool_call_chain,
         )
         if msg_bc > 0 and not validate_tool_call_chain(locked_msgs):
-            safe_bps = None
-            if best_chain.get("safe_breakpoints"):
-                try:
-                    safe_bps = json.loads(best_chain["safe_breakpoints"])
-                except (json.JSONDecodeError, TypeError):
-                    safe_bps = None
-            if safe_bps is None:
-                safe_bps = compute_safe_breakpoints(msg_p)
+            safe_bps = compute_safe_breakpoints(msg_p)
             # 后向匹配可能跨 tool_call 边界，用 safe_breakpoints 修正
             safe_trunc = find_safe_truncation(safe_bps, n - msg_bc)
             if safe_trunc < n - msg_bc:
@@ -195,83 +192,15 @@ class PrefixLockStage(Stage):
         ctx.meta["pref_tools_hit"] = tools_fc
         ctx.meta["pref_msgs_hit"] = msg_fc
 
-        # est 数据 — from MemoryStore (0 I/O)
+        # 设置 matched_chain, anchor_moment, new_char_count
         pref_hit = total_hit
-        chain_tc = store.get_chain_tokens_and_chars(best_chain["chain_id"], pref_hit)
-        if chain_tc is None:
-            chain_tc_ge = store.get_chain_tokens_ge(best_chain["chain_id"], pref_hit)
-            if chain_tc_ge is not None:
-                ge_tokens, ge_chars, ge_msg_count = chain_tc_ge
-                overflow = ge_msg_count - pref_hit
-                if overflow > 0 and ge_chars > 0:
-                    overflow_chars = sum(
-                        len(json.dumps(all_msgs_p[pref_hit + i], ensure_ascii=False))
-                        for i in range(min(overflow, len(all_msgs_p) - pref_hit))
-                    )
-                    tpc = ge_tokens / ge_chars
-                    prefix_tokens_est = int(ge_tokens - overflow_chars * tpc)
-                else:
-                    prefix_tokens_est = ge_tokens
-
-                from deepseek_tap_proxy.shared.prefix import make_chain_id, compute_safe_breakpoints as _bps
-                from deepseek_tap_proxy.shared.colors import green
-
-                _prefix_context = all_msgs_p[:pref_hit]
-                _prefix_cc = compute_char_count(_prefix_context)
-
-                _p_sys = _prefix_context[:len(sys_p)]
-                _p_tools = _prefix_context[len(sys_p):len(sys_p) + len(tools_p)]
-                _p_msgs = _prefix_context[len(sys_p) + len(tools_p):]
-
-                # 旧版 hash 截断：sys_n / tools_n 仍保留为 fc-1
-                _sys_n = sys_fc - 1 if sys_fc > 0 else -1
-                _tools_n = tools_fc - 1 if tools_fc > 0 else -1
-
-                _prefix_hashes = (
-                    best_chain["sys_hashes"].split(",")[:_sys_n + 1] +
-                    best_chain["tools_hashes"].split(",")[:_tools_n + 1] +
-                    best_chain["messages_hashes"].split(",")[:msg_fc]
-                )
-                _prefix_chain_id = make_chain_id(_prefix_hashes)
-
-                # MemoryStore write (0 I/O)
-                store.upsert_chain(
-                    ctx.session_id, _prefix_chain_id,
-                    sys=json.dumps(_p_sys), tools=json.dumps(_p_tools),
-                    messages=json.dumps(_p_msgs),
-                    sys_hashes=",".join(best_chain["sys_hashes"].split(",")[:_sys_n + 1]),
-                    tools_hashes=",".join(best_chain["tools_hashes"].split(",")[:_tools_n + 1]),
-                    messages_hashes=",".join(best_chain["messages_hashes"].split(",")[:msg_fc]),
-                    msg_count=pref_hit, safe_breakpoints=_bps(_prefix_context), is_frozen=True,
-                    family_key=ctx.family_key,
-                )
-                store.insert_chain_token(_prefix_chain_id, pref_hit, prefix_tokens_est, _prefix_cc)
-
-                # Fire-and-forget SQLite writes
-                _schedule_chain_persist(store, ctx.session_id, _prefix_chain_id,
-                                        json.dumps(_p_sys), json.dumps(_p_tools),
-                                        json.dumps(_p_msgs),
-                                        ",".join(best_chain["sys_hashes"].split(",")[:_sys_n + 1]),
-                                        ",".join(best_chain["tools_hashes"].split(",")[:_tools_n + 1]),
-                                        ",".join(best_chain["messages_hashes"].split(",")[:msg_fc]),
-                                        pref_hit, _bps(_prefix_context), True,
-                                        _prefix_chain_id, pref_hit, prefix_tokens_est, _prefix_cc)
-
-                print(green(f"  [chain] + prefix: {_prefix_chain_id[:16]}... "
-                            f"(s={sys_fc} t={tools_fc} m={msg_fc}, frozen, est={prefix_tokens_est}t)"))
-
-                chain_tokens = prefix_tokens_est
-                chain_char_count = _prefix_cc
-            else:
-                chain_tokens = 0
-                chain_char_count = 0
-        else:
-            chain_tokens = chain_tc[0]
-            chain_char_count = chain_tc[1]
-        ctx.meta["chain_tokens_est"] = chain_tokens
-        ctx.meta["chain_char_count"] = chain_char_count
+        ctx.matched_chain = best_chain
+        ctx.anchor_moment = _find_anchor(best_chain.moments, pref_hit)
         new_msgs = all_msgs_c[pref_hit:]
-        ctx.meta["new_char_count"] = compute_char_count(new_msgs)
+        ctx.new_char_count = compute_char_count(new_msgs)
+
+        # 从 anchor_moment 获取 tokens 用于 chain_action
+        chain_tokens = ctx.anchor_moment.total_tokens if ctx.anchor_moment else 0
 
         # 写回规范形式 — setter 自动刷新 hash chain
         ctx.sys = locked_sys
@@ -296,10 +225,10 @@ class PrefixLockStage(Stage):
 
         cc = compute_char_count(locked_sys + locked_tools + locked_msgs)
 
-        _matched_is_frozen = bool(best_chain.get("is_frozen"))
-        if len(all_msgs_c) > len(all_msgs_p) and not _matched_is_frozen:
+        # All chains are mutable (is_frozen removed); always extend when longer
+        if len(all_msgs_c) > len(all_msgs_p):
             ctx.chain_action = ChainAction(
-                action="update", chain_id=best_chain["chain_id"],
+                action="update", chain_id=best_chain.chain_id,
                 msg_count=len(locked_sys) + len(locked_tools) + len(locked_msgs),
                 sys_hashes=ctx.sys_hash_chain, tools_hashes=ctx.tools_hash_chain,
                 messages_hashes=ctx.messages_hash_chain,
@@ -323,29 +252,3 @@ class PrefixLockStage(Stage):
         if ctx.chain_action.action == "update":
             ctx.persist.chain_tokens = chain_tokens or 0
         return ctx
-
-
-def _schedule_chain_persist(store: MemoryStore, session_id: str, chain_id: str,
-                            sys: str, tools: str, messages: str,
-                            sys_hashes: str, tools_hashes: str, messages_hashes: str,
-                            msg_count: int, safe_breakpoints: list[int] | None,
-                            is_frozen: bool,
-                            cth_chain_id: str, cth_msg_count: int,
-                            cth_tokens: int, cth_char_count: int) -> None:
-    """Fire-and-forget: persist frozen prefix chain + token to SQLite."""
-    from deepseek_tap_proxy.shared.db import upsert_prefix_chain as _upsert, insert_chain_token as _insert
-
-    def _write(conn, sid, cid, s, t, m, sh, th, mh, mc, sb, frozen,
-               tcid, tm, ttk, tcc):
-        _upsert(conn, sid, cid, sys=s, tools=t, messages=m,
-                sys_hashes=sh, tools_hashes=th, messages_hashes=mh,
-                msg_count=mc, safe_breakpoints=sb, is_frozen=frozen)
-        _insert(conn, tcid, msg_count=tm, tokens=ttk, char_count=tcc)
-
-    store.enqueue_sqlite_write(
-        _write, session_id, chain_id, sys, tools, messages,
-        sys_hashes, tools_hashes, messages_hashes,
-        msg_count, safe_breakpoints, is_frozen,
-        cth_chain_id, cth_msg_count, cth_tokens, cth_char_count,
-        op_name="prefix_persist",
-    )

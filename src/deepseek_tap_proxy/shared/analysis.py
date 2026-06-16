@@ -167,3 +167,36 @@ def is_same_session(curr_hashes: list[str], max_hashes: list[str], threshold: in
                 else:
                     consecutive = 0
     return False
+
+
+def find_cross_alignment(
+    pure_hashes: list[str],
+    chain_hashes: list[str],
+    threshold: int = 3,
+) -> int | None:
+    """在 chain_hashes 中找 pure_hashes 的交叉对齐位置。
+
+    滑动窗口：pure_hashes[0] 对齐 chain_hashes[offset]，
+    pure_hashes[1] 对齐 chain_hashes[offset+1]，
+    连续匹配 >= threshold 即返回 offset。
+
+    Returns:
+        偏移量（chain 中 pure[0] 的位置），或 None（无匹配）。
+    """
+    if not pure_hashes or not chain_hashes:
+        return None
+    if len(pure_hashes) < threshold:
+        return None
+
+    max_start = len(chain_hashes) - threshold
+    for start in range(max_start + 1):
+        match_len = 0
+        max_match = min(len(pure_hashes), len(chain_hashes) - start)
+        for j in range(max_match):
+            if pure_hashes[j] == chain_hashes[start + j]:
+                match_len += 1
+            else:
+                break
+        if match_len >= threshold:
+            return start
+    return None

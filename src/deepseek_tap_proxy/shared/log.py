@@ -38,7 +38,7 @@ class LogView:
         session_id, client_type, session_method, chat_type,
         cache_hit_tokens, cache_miss_tokens, lock_type, sys_tools_locked,
         pref_hit_count, orig_sys_len, orig_tools_len, orig_msgs_len,
-        chain_action, chain_tokens_est, chain_char_count, new_char_count,
+        chain_action, anchor_moment (total_tokens, char_count), new_char_count,
         persist (lock_type, chain_tokens, timestamp, api_format)
     """
 
@@ -127,15 +127,14 @@ class LogView:
         pref_kv = f"pref(stm)={s_str} {t_str} {m_str}"
 
         # ── est (prefix-cache token ratio; ? = no token history yet) ──
-        chain_tokens = c.meta.get("chain_tokens_est", 0) or r.chain_tokens
-        chain_cc = c.meta.get("chain_char_count", 0)
-        new_cc = c.meta.get("new_char_count", 0)
-        if chain_tokens and chain_cc and chain_tokens > 0:
-            avg_tpc = chain_tokens / chain_cc
+        anchor = c.anchor_moment
+        new_cc = c.new_char_count
+        if anchor and anchor.total_tokens > 0 and new_cc > 0:
+            avg_tpc = anchor.total_tokens / anchor.char_count
             new_tokens_est = int(new_cc * avg_tpc)
-            est_denom = chain_tokens + new_tokens_est
-            est_pct = round(chain_tokens / est_denom * 100, 2) if est_denom else 0.0
-            est_str = f"{chain_tokens}/{est_denom}({est_pct:.2f}%)"
+            est_denom = anchor.total_tokens + new_tokens_est
+            est_pct = round(anchor.total_tokens / est_denom * 100, 2)
+            est_str = f"{anchor.total_tokens}/{est_denom}({est_pct:.2f}%)"
         else:
             est_pct = 0.0
             est_str = "?"
@@ -229,14 +228,13 @@ class LogView:
         cache_hit = r.cache_hit_tokens or c.meta.get("cache_hit_tokens", 0)
         cache_miss = r.cache_miss_tokens or c.meta.get("cache_miss_tokens", 0)
 
-        chain_tokens = c.meta.get("chain_tokens_est", 0) or r.chain_tokens
-        chain_cc = c.meta.get("chain_char_count", 0)
-        new_cc = c.meta.get("new_char_count", 0)
-        if chain_tokens and chain_cc and chain_tokens > 0:
-            avg_tpc = chain_tokens / chain_cc
+        anchor = c.anchor_moment
+        new_cc = c.new_char_count
+        if anchor and anchor.total_tokens > 0 and anchor.char_count > 0 and new_cc > 0:
+            avg_tpc = anchor.total_tokens / anchor.char_count
             new_tokens_est = int(new_cc * avg_tpc)
-            est_denom = chain_tokens + new_tokens_est
-            est_pct = round(chain_tokens / est_denom * 100, 2) if est_denom else 0.0
+            est_denom = anchor.total_tokens + new_tokens_est
+            est_pct = round(anchor.total_tokens / est_denom * 100, 2) if est_denom else 0.0
         else:
             est_pct = 0.0
 

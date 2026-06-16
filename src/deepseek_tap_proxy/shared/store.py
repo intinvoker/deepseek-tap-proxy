@@ -43,6 +43,14 @@ class SessionRecord:
 
 
 @dataclass
+class HashIndex:
+    """Lazily-built hash index for a chain's sys/tools/messages."""
+    sys_hashes: list[str] = field(default_factory=list)
+    tools_hashes: list[str] = field(default_factory=list)
+    messages_hashes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ChainRecord:
     chain_id: str
     session_id: str = ""
@@ -58,6 +66,7 @@ class ChainRecord:
     is_frozen: bool = False
     created_at: str = ""
     last_seen: str = ""
+    moments: str = "[]"
 
     def as_dict(self) -> dict:
         """Return dict for compatibility with old db-returned Row objects."""
@@ -76,16 +85,8 @@ class ChainRecord:
             "is_frozen": self.is_frozen,
             "created_at": self.created_at,
             "last_seen": self.last_seen,
+            "moments": self.moments,
         }
-
-
-@dataclass
-class ChainTokenRecord:
-    chain_id: str
-    msg_count: int
-    tokens: int
-    char_count: int = 0
-    created_at: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -117,9 +118,6 @@ class MemoryStore:
 
         # session_id → family_key → list[ChainRecord]  (sorted by last_seen desc)
         self._chains: dict[str, dict[str, list[ChainRecord]]] = {}
-
-        # chain_id → list[ChainTokenRecord]  (sorted by msg_count asc)
-        self._token_history: dict[str, list[ChainTokenRecord]] = {}
 
         # Single-writer queue for SQLite (prevents "database is locked")
         self._write_queue: asyncio.Queue | None = None
@@ -270,19 +268,76 @@ class MemoryStore:
         return h.hexdigest()[:16]
 
     def get_session_chains(self, session_id: str) -> list[dict]:
-        """Get ALL prefix chains for a session (flattened, backward compat)."""
+        """Get ALL prefix chains for a session as ``Chain`` objects (flattened)."""
+        from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
+
         family_map = self._chains.get(session_id, {})
-        chains: list[dict] = []
+        chains: list[Chain] = []
         for clist in family_map.values():
-            chains.extend(c.as_dict() for c in clist)
-        # 保持按 last_seen desc 排序
-        chains.sort(key=lambda c: c.get("last_seen", ""), reverse=True)
+            for c in clist:
+                chains.append(self._record_to_chain(c))
+        chains.sort(key=lambda c: c.created_at, reverse=True)
         return chains
 
-    def get_family_chains(self, session_id: str, family_key: str) -> list[dict]:
-        """Get prefix chains for a specific branch family within a session."""
+    def get_family_chains(self, session_id: str, family_key: str) -> list:
+        """Get prefix chains for a specific branch family as ``Chain`` objects."""
+        from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
+
         clist = self._chains.get(session_id, {}).get(family_key, [])
-        return [c.as_dict() for c in clist]
+        return [self._record_to_chain(c) for c in clist]
+
+    def get_chain_hashes(self, chain_id: str) -> HashIndex | None:
+        """Return lazily-built hash index for a chain.
+
+        Scans all families for the given chain_id and parses the
+        comma-separated hash strings into lists.
+        """
+        for family_map in self._chains.values():
+            for clist in family_map.values():
+                for rec in clist:
+                    if rec.chain_id == chain_id:
+                        return HashIndex(
+                            sys_hashes=rec.sys_hashes.split(",") if rec.sys_hashes else [],
+                            tools_hashes=rec.tools_hashes.split(",") if rec.tools_hashes else [],
+                            messages_hashes=rec.messages_hashes.split(",") if rec.messages_hashes else [],
+                        )
+        return None
+
+    @staticmethod
+    def _record_to_chain(rec: 'ChainRecord') -> 'Chain':
+        """Convert a ChainRecord to a Chain object with parsed fields."""
+        from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
+        from deepseek_tap_proxy.shared.stages.helpers import json_list
+
+        # Parse moments JSON -> list[ChainMoment]
+        moments = []
+        try:
+            raw_moments = json.loads(rec.moments or "[]")
+            for m in raw_moments:
+                moments.append(ChainMoment(
+                    messages_count=m.get("messages_count", 0),
+                    op=m.get("op", ""),
+                    total_tokens=m.get("total_tokens", 0),
+                    cache_hit_tokens=m.get("cache_hit_tokens", 0),
+                    cache_miss_tokens=m.get("cache_miss_tokens", 0),
+                    char_count=m.get("char_count", 0),
+                    timestamp=m.get("timestamp", ""),
+                ))
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            moments = []
+
+        return Chain(
+            chain_id=rec.chain_id,
+            session_id=rec.session_id,
+            sys=json_list(rec.sys),
+            tools=json_list(rec.tools),
+            messages=json_list(rec.messages),
+            created_at=rec.created_at,
+            moments=moments,
+            sys_hashes=rec.sys_hashes,
+            tools_hashes=rec.tools_hashes,
+            messages_hashes=rec.messages_hashes,
+        )
 
     def upsert_chain(self, session_id: str, chain_id: str, *,
                      sys: str = "[]", tools: str = "[]", messages: str = "[]",
@@ -291,7 +346,8 @@ class MemoryStore:
                      msg_count: int = 0,
                      safe_breakpoints: list[int] | None = None,
                      is_frozen: bool = False,
-                     family_key: str = "") -> ChainRecord:
+                     family_key: str = "",
+                     moments: str = "[]") -> ChainRecord:
         """Insert or update a prefix chain.
 
         When ``family_key`` is empty it is computed from ``sys_hashes``
@@ -320,6 +376,9 @@ class MemoryStore:
                             c.msg_count = msg_count
                             c.safe_breakpoints = sb_json
                             c.last_seen = now
+                            # Preserve existing moments (append-only field)
+                            if moments != "[]" and moments != c.moments:
+                                c.moments = moments
                         return c
 
         # Create new
@@ -330,6 +389,7 @@ class MemoryStore:
             messages_hashes=messages_hashes,
             msg_count=msg_count, safe_breakpoints=sb_json,
             is_frozen=is_frozen, created_at=now, last_seen=now,
+            moments=moments,
         )
         fmap = self._chains.setdefault(session_id, {})
         fmap.setdefault(family_key, []).append(rec)
@@ -337,43 +397,60 @@ class MemoryStore:
         fmap[family_key].sort(key=lambda c: c.last_seen, reverse=True)
         return rec
 
-    # ── Chain token history ──────────────────────────────────────
+    # ── Chain moments ──────────────────────────────────────────────
 
-    def insert_chain_token(self, chain_id: str, msg_count: int,
-                           tokens: int, char_count: int = 0) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        rec = ChainTokenRecord(
-            chain_id=chain_id, msg_count=msg_count,
-            tokens=tokens, char_count=char_count, created_at=now,
-        )
-        history = self._token_history.setdefault(chain_id, [])
-        # Check for duplicate (chain_id, msg_count) — insert or ignore
-        for i, h in enumerate(history):
-            if h.msg_count == msg_count:
-                return  # already exists
-        history.append(rec)
-        history.sort(key=lambda h: h.msg_count)
-
-    def get_chain_tokens_and_chars(self, chain_id: str,
-                                   msg_count: int) -> tuple[int, int] | None:
-        """Get (tokens, char_count) for closest version ≤ msg_count."""
-        history = self._token_history.get(chain_id, [])
-        best = None
-        for h in history:
-            if h.msg_count <= msg_count:
-                best = h
-            else:
-                break
-        return (best.tokens, best.char_count) if best else None
-
-    def get_chain_tokens_ge(self, chain_id: str,
-                            msg_count: int) -> tuple[int, int, int] | None:
-        """Get (tokens, char_count, msg_count) for closest version ≥ msg_count."""
-        history = self._token_history.get(chain_id, [])
-        for h in history:
-            if h.msg_count >= msg_count:
-                return (h.tokens, h.char_count, h.msg_count)
+    def get_chain_record(self, chain_id: str):
+        """Find a ChainRecord by chain_id, returning None if not found."""
+        for fmap in self._chains.values():
+            for clist in fmap.values():
+                for c in clist:
+                    if c.chain_id == chain_id:
+                        return c
         return None
+
+    def add_moment(self, chain_id: str, moment: 'ChainMoment') -> None:
+        """Append a ChainMoment to an existing chain.
+
+        Updates in-memory record (0 I/O) and queues a fire-and-forget
+        SQLite write targeting the ``moments`` JSON column.
+        """
+        from deepseek_tap_proxy.shared.chain import ChainMoment
+
+        # Find chain record by chain_id
+        for fmap in self._chains.values():
+            for clist in fmap.values():
+                for c in clist:
+                    if c.chain_id == chain_id:
+                        # Parse existing moments
+                        try:
+                            moments = json.loads(c.moments or "[]")
+                        except (json.JSONDecodeError, TypeError):
+                            moments = []
+                        # Append new moment as dict
+                        moments.append({
+                            "messages_count": moment.messages_count,
+                            "op": moment.op,
+                            "total_tokens": moment.total_tokens,
+                            "cache_hit_tokens": moment.cache_hit_tokens,
+                            "cache_miss_tokens": moment.cache_miss_tokens,
+                            "char_count": moment.char_count,
+                            "timestamp": moment.timestamp,
+                        })
+                        c.moments = json.dumps(moments)
+                        # Queue SQLite write
+                        self._enqueue_moment_persist(chain_id, moments)
+                        return
+
+    def _enqueue_moment_persist(self, chain_id: str, moments: list[dict]) -> None:
+        """Fire-and-forget: update the moments JSON column in SQLite."""
+        def _write(conn, cid, m_json):
+            conn.execute(
+                "UPDATE prefix_chains SET moments = ? WHERE chain_id = ?",
+                (json.dumps(m_json), cid),
+            )
+            conn.commit()
+
+        self.enqueue_sqlite_write(_write, chain_id, moments, op_name="chain_moment")
 
     # ── Persist queue ────────────────────────────────────────────
 
@@ -629,6 +706,7 @@ class MemoryStore:
                             is_frozen=bool(d.get("is_frozen", 0)),
                             created_at=d.get("created_at", now),
                             last_seen=d.get("last_seen", now),
+                            moments=d.get("moments", "[]"),
                         )
                         store._chains.setdefault(rec.session_id, {}) \
                             .setdefault(store.compute_family_key(rec.sys_hashes, rec.tools_hashes), []) \
@@ -636,28 +714,9 @@ class MemoryStore:
                 except sqlite3.OperationalError:
                     pass
 
-                # Load chain token history
-                try:
-                    rows = conn.execute(
-                        "SELECT * FROM chain_token_history ORDER BY chain_id, msg_count ASC"
-                    ).fetchall()
-                    for row in rows:
-                        d = dict(row)
-                        rec = ChainTokenRecord(
-                            chain_id=d.get("chain_id", ""),
-                            msg_count=d.get("msg_count", 0),
-                            tokens=d.get("tokens", 0),
-                            char_count=d.get("char_count", 0),
-                            created_at=d.get("created_at", now),
-                        )
-                        store._token_history.setdefault(rec.chain_id, []).append(rec)
-                except sqlite3.OperationalError:
-                    pass
-
                 log.info(
-                    "MemoryStore loaded from DB: %d sessions, %d chains, %d token records",
+                    "MemoryStore loaded from DB: %d sessions, %d chains",
                     len(store._sessions), sum(len(c) for c in store._chains.values()),
-                    sum(len(h) for h in store._token_history.values()),
                 )
             finally:
                 # Close the load-thread Database connection to release any

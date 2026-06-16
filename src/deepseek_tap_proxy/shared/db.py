@@ -99,7 +99,8 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
                         msg_count: int,
                         safe_breakpoints: list[int] | None = None,
                         total_input_tokens: int = 0,
-                        is_frozen: bool = False) -> None:
+                        is_frozen: bool = False,
+                        moments: str = "[]") -> None:
     """Insert or update a prefix chain. Only updates if msg_count is longer.
 
     ``sys``, ``tools``, ``messages`` are JSON strings — canonical form triples.
@@ -107,6 +108,7 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
     ``total_input_tokens`` is the upstream's total input token count for this request,
     used for estimating KV cache hit rates on subsequent requests.
     ``is_frozen`` marks a public prefix chain — never updated once created.
+    ``moments`` is a JSON array of Moment dicts.
     """
     now = datetime.now(timezone.utc).isoformat()
     safe_breakpoints_json = json.dumps(safe_breakpoints) if safe_breakpoints is not None else None
@@ -115,8 +117,8 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
             (session_id, chain_id, sys, tools, messages,
              sys_hashes, tools_hashes, messages_hashes,
              msg_count,
-             safe_breakpoints, total_input_tokens, is_frozen, created_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             safe_breakpoints, total_input_tokens, is_frozen, created_at, last_seen, moments)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chain_id) DO UPDATE SET
             sys = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
                        THEN ? ELSE prefix_chains.sys END,
@@ -139,7 +141,7 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
     """, (session_id, chain_id, sys, tools, messages,
           sys_hashes, tools_hashes, messages_hashes,
           msg_count,
-          safe_breakpoints_json, total_input_tokens, is_frozen, now, now,
+          safe_breakpoints_json, total_input_tokens, is_frozen, now, now, moments,
           msg_count, sys, msg_count, tools, msg_count, messages,
           msg_count, sys_hashes, msg_count, tools_hashes, msg_count, messages_hashes,
           msg_count, msg_count, msg_count, safe_breakpoints_json,
@@ -251,6 +253,11 @@ def create_prefix_chains_table(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE prefix_chains ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+    # Migration: moments JSON column (2026-06-16)
+    try:
+        conn.execute("ALTER TABLE prefix_chains ADD COLUMN moments TEXT DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 
@@ -266,11 +273,16 @@ def get_session_chains(conn: sqlite3.Connection, session_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-# ── Chain token history table ──
+# ── Chain token history table (deprecated, kept for backward compat) ──
 
 
 def create_chain_token_history_table(conn: sqlite3.Connection) -> None:
-    """Create the chain_token_history table for precise token estimation."""
+    """Create the chain_token_history table for backward compatibility.
+
+    The table exists in existing SQLite databases and is kept for
+    backward compatibility. No new data is written to it — token
+    estimates are now stored in chain moments.
+    """
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS chain_token_history (
             chain_id    TEXT NOT NULL REFERENCES prefix_chains(chain_id),
@@ -293,74 +305,6 @@ def create_chain_token_history_table(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass  # column already exists
     conn.commit()
-
-
-def insert_chain_token(conn: sqlite3.Connection, chain_id: str, *,
-                       msg_count: int, tokens: int,
-                       char_count: int = 0) -> None:
-    """Record a token snapshot for a chain version.
-
-    Called after each chain CREATE or UPDATE to record the exact
-    ``total_input_tokens`` from the upstream response.
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("""
-        INSERT OR IGNORE INTO chain_token_history (chain_id, msg_count, tokens, char_count, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (chain_id, msg_count, tokens, char_count, now))
-    conn.commit()
-
-
-def get_chain_tokens(conn: sqlite3.Connection, chain_id: str,
-                     msg_count: int) -> int | None:
-    """Get the exact total_input_tokens for the closest version ≤ msg_count.
-
-    Returns ``None`` if no record exists or the table doesn't exist yet.
-    """
-    try:
-        row = conn.execute("""
-            SELECT tokens FROM chain_token_history
-            WHERE chain_id = ? AND msg_count <= ?
-            ORDER BY msg_count DESC LIMIT 1
-        """, (chain_id, msg_count)).fetchone()
-        return row["tokens"] if row else None
-    except sqlite3.OperationalError:
-        return None
-
-
-def get_chain_tokens_and_chars(conn: sqlite3.Connection, chain_id: str,
-                               msg_count: int) -> tuple[int, int] | None:
-    """Get (tokens, char_count) for the closest version ≤ msg_count.
-
-    Returns ``None`` if no record exists or the table doesn't exist yet.
-    """
-    try:
-        row = conn.execute("""
-            SELECT tokens, char_count FROM chain_token_history
-            WHERE chain_id = ? AND msg_count <= ?
-            ORDER BY msg_count DESC LIMIT 1
-        """, (chain_id, msg_count)).fetchone()
-        return (row["tokens"], row["char_count"]) if row else None
-    except sqlite3.OperationalError:
-        return None
-
-
-def get_chain_tokens_ge(conn: sqlite3.Connection, chain_id: str,
-                        msg_count: int) -> tuple[int, int, int] | None:
-    """Get (tokens, char_count, msg_count) for the closest version ≥ msg_count.
-
-    Fallback when ``get_chain_tokens_and_chars`` returns None：
-    pref_hit 小于链的首个 token_history 记录 → 向更大的方向查找。
-    """
-    try:
-        row = conn.execute("""
-            SELECT tokens, char_count, msg_count FROM chain_token_history
-            WHERE chain_id = ? AND msg_count >= ?
-            ORDER BY msg_count ASC LIMIT 1
-        """, (chain_id, msg_count)).fetchone()
-        return (row["tokens"], row["char_count"], row["msg_count"]) if row else None
-    except sqlite3.OperationalError:
-        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════

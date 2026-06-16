@@ -11,6 +11,7 @@ from deepseek_tap_proxy.shared.stages.request_analysis import (
 )
 from deepseek_tap_proxy.shared.stages.sys_tools_lock import SysToolsLockStage
 from deepseek_tap_proxy.shared.stages.prefix_lock import PrefixLockStage
+from deepseek_tap_proxy.shared.stages.compaction_lock import CompactionLockStage
 from deepseek_tap_proxy.shared.stages.cache_analysis import apply_cache_analysis, emit_request_log
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "RequestClassifierStage",
     "SysToolsLockStage",
     "PrefixLockStage",
+    "CompactionLockStage",
     "apply_cache_analysis",
     "emit_request_log",
 ]
