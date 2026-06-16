@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 
 from deepseek_tap_proxy.pipeline.chain_action import ChainAction
-from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
+from deepseek_tap_proxy.shared.chain import Chain, ChainMoment, find_anchor_moment
 
 
 def compute_char_count(messages: list[dict]) -> int:
@@ -176,7 +176,7 @@ def create_chain_moment(ctx, store) -> None:
     moment = ChainMoment(
         messages_count=len(ctx.sys) + len(ctx.tools) + len(ctx.messages),
         op=op,
-        total_tokens=ctx.persist.total_input_tokens or 0,
+        total_tokens=(ctx.persist.total_input_tokens or 0) + (ctx.persist.output_tokens or 0),
         cache_hit_tokens=ctx.persist.cache_hit_tokens or 0,
         cache_miss_tokens=ctx.persist.cache_miss_tokens or 0,
         char_count=compute_char_count(ctx.sys + ctx.tools + ctx.messages),
@@ -257,3 +257,130 @@ def _ensure_chain_exists(ctx, store, chain_id: str) -> None:
         msg_cnt,
         op_name="chain_persist",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  公共前缀冻结链（fork 场景 est 锚点）
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _find_anchor_across_chains(
+    chains: list[Chain], pref_hit: int,
+) -> ChainMoment | None:
+    """在所有同族链的 moments 中查找 ≤ pref_hit 的锚点。
+
+    用于 find_anchor_moment(best_chain) 失败时的跨链 fallback。
+    冻结链 (is_frozen) 的 moment 在此处被消费。
+    """
+    best: ChainMoment | None = None
+    for chain in chains:
+        anchor = find_anchor_moment(chain.moments, pref_hit)
+        if anchor is not None:
+            if best is None or anchor.messages_count > best.messages_count:
+                best = anchor
+    return best
+
+
+def _ensure_frozen_chain(
+    store, ref_chain: Chain, pref_hit: int,
+    session_id: str, family_key: str,
+) -> ChainMoment | None:
+    """基于参考链创建公共前缀 frozen chain 并返回估算 moment。
+
+    Frozen chain 特性：
+    - is_frozen=True，永不被后续请求 UPDATE
+    - 同 family_key，get_family_chains() 自然返回
+    - 仅有 1 个估算 moment（token 按 messages_count 比例分割）
+    - 创建前检查 idempotent（已在同 family + 同长度时不重复创建）
+
+    精度：假设消息 token/char 均匀分布，偏差约 1-3%（已知限制）。
+    """
+    from deepseek_tap_proxy.shared.hash import msg_hash
+    from deepseek_tap_proxy.shared.prefix import make_chain_id
+
+    if not ref_chain.moments:
+        return None
+
+    smallest = min(ref_chain.moments, key=lambda m: m.messages_count)
+    if smallest.messages_count <= pref_hit:
+        return None  # _find_anchor 应该已经找到了
+
+    # ── 1. 检查 idempotent：是否已存在同 family + 同长度的 frozen chain ──
+    all_chains = store.get_family_chains(session_id, family_key)
+    for c in all_chains:
+        total = len(c.sys) + len(c.tools) + len(c.messages)
+        if total == pref_hit and c.chain_id != ref_chain.chain_id:
+            anchor = find_anchor_moment(c.moments, pref_hit)
+            if anchor is not None:
+                return anchor  # 已存在，直接消费
+
+    # ── 2. 估算前缀 moment ──
+    ratio = pref_hit / smallest.messages_count
+    estimated = ChainMoment(
+        messages_count=pref_hit,
+        op="create",
+        total_tokens=int(smallest.total_tokens * ratio),
+        cache_hit_tokens=int((smallest.cache_hit_tokens or 0) * ratio),
+        cache_miss_tokens=int((smallest.cache_miss_tokens or 0) * ratio),
+        char_count=int((smallest.char_count or 0) * ratio),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+    # ── 3. 提取前缀消息（按 sys → tools → messages 顺序截断） ──
+    prefix_sys: list[dict] = []
+    prefix_tools: list[dict] = []
+    prefix_msgs: list[dict] = []
+    remaining = pref_hit
+    for item in ref_chain.sys:
+        if remaining <= 0:
+            break
+        prefix_sys.append(item)
+        remaining -= 1
+    for item in ref_chain.tools:
+        if remaining <= 0:
+            break
+        prefix_tools.append(item)
+        remaining -= 1
+    for item in ref_chain.messages:
+        if remaining <= 0:
+            break
+        prefix_msgs.append(item)
+        remaining -= 1
+
+    # ── 4. 计算 hash chain ──
+    sys_hashes_str = ",".join(msg_hash(m) for m in prefix_sys)
+    tools_hashes_str = ",".join(msg_hash(m) for m in prefix_tools)
+    msgs_hashes_str = ",".join(msg_hash(m) for m in prefix_msgs)
+    _all_hashes = (
+        sys_hashes_str.split(",") if sys_hashes_str else []
+    ) + (
+        tools_hashes_str.split(",") if tools_hashes_str else []
+    ) + (
+        msgs_hashes_str.split(",") if msgs_hashes_str else []
+    )
+    frozen_chain_id = make_chain_id(_all_hashes)
+
+    # ── 5. 持久化 frozen chain + moment ──
+    store.upsert_chain(
+        session_id, frozen_chain_id,
+        sys=json.dumps(prefix_sys),
+        tools=json.dumps(prefix_tools),
+        messages=json.dumps(prefix_msgs),
+        sys_hashes=sys_hashes_str,
+        tools_hashes=tools_hashes_str,
+        messages_hashes=msgs_hashes_str,
+        msg_count=pref_hit,
+        is_frozen=True,
+        family_key=family_key,
+        moments=json.dumps([{
+            "messages_count": estimated.messages_count,
+            "op": estimated.op,
+            "total_tokens": estimated.total_tokens,
+            "cache_hit_tokens": estimated.cache_hit_tokens,
+            "cache_miss_tokens": estimated.cache_miss_tokens,
+            "char_count": estimated.char_count,
+            "timestamp": estimated.timestamp,
+        }]),
+    )
+
+    return estimated

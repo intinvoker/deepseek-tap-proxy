@@ -17,10 +17,21 @@ from deepseek_tap_proxy.shared.chain import Chain
 from deepseek_tap_proxy.shared.store import MemoryStore
 from deepseek_tap_proxy.shared.stages.helpers import (
     compute_char_count, json_list, chain_hash_view, find_chain_result, create_chain,
+    _find_anchor_across_chains, _ensure_frozen_chain,
 )
-from deepseek_tap_proxy.shared.stages.compaction_lock import _find_anchor
+from deepseek_tap_proxy.shared.chain import find_anchor_moment
 
 log = logging.getLogger("deepseek-tap")
+
+
+def _find_ref_chain(sys_result, tools_result, chains: list[Chain]) -> Chain | None:
+    """从 sys/tools 匹配结果中找到参考链（用于 frozen chain 创建）。"""
+    for result in (tools_result, sys_result):
+        if result is not None:
+            for c in chains:
+                if c.chain_id == result.chain_id:
+                    return c
+    return None
 
 
 class PrefixLockStage(Stage):
@@ -92,7 +103,26 @@ class PrefixLockStage(Stage):
         sys_result = _match_segment("sys_hashes", ctx.sys_hashes)
         tools_result = _match_segment("tools_hashes", ctx.tools_hashes)
 
+        # 三段命中提前写入 meta（无论 msg 是否匹配，LogView 都能读到）
+        # 修复：压缩后 msg_result=None 但 sys/tools 可能跨链命中
+        sys_fc_pre = sys_result.fc if sys_result else 0
+        tools_fc_pre = tools_result.fc if tools_result else 0
+        ctx.meta["pref_sys_hit"] = sys_fc_pre
+        ctx.meta["pref_tools_hit"] = tools_fc_pre
+
         if msg_result is None:
+            ctx.meta["pref_msgs_hit"] = 0
+            # ── 跨链锚点：fork 后 tools 匹配但 messages 不匹配 ──
+            _ref = _find_ref_chain(sys_result, tools_result, chains)
+            if _ref is not None and store:
+                _pref = sys_fc_pre + tools_fc_pre
+                anchor = _find_anchor_across_chains(chains, _pref)
+                if anchor is None:
+                    anchor = _ensure_frozen_chain(
+                        store, _ref, _pref,
+                        session_id, ctx.family_key or "",
+                    )
+                ctx.anchor_moment = anchor
             create_chain(ctx, all_msgs_c, hit_count=0)
             return ctx
 
@@ -187,15 +217,27 @@ class PrefixLockStage(Stage):
 
         # ── Hit count：fc + bc（而非旧 n+1） ──
         total_hit = msg_fc + msg_bc
-        ctx.meta["pref_hit_count"] = total_hit
-        ctx.meta["pref_sys_hit"] = sys_fc
-        ctx.meta["pref_tools_hit"] = tools_fc
+        # Bug 1 fix: pref_hit 含三段总和（用于 _find_anchor + all_msgs_c 切片）
+        # 之前只含 msg_fc+msg_bc，遗漏 sys+tools，导致 _find_anchor 找不到 moment → est=?
+        pref_hit = sys_fc + tools_fc + msg_fc + msg_bc
+        ctx.meta["pref_hit_count"] = pref_hit
+        # 只在 best_chain 有匹配时覆盖 pre-gate 值（防 frozen chain 污染）
+        ctx.meta["pref_sys_hit"] = sys_fc if sys_best else ctx.meta["pref_sys_hit"]
+        ctx.meta["pref_tools_hit"] = tools_fc if tools_best else ctx.meta["pref_tools_hit"]
         ctx.meta["pref_msgs_hit"] = msg_fc
 
         # 设置 matched_chain, anchor_moment, new_char_count
-        pref_hit = total_hit
         ctx.matched_chain = best_chain
-        ctx.anchor_moment = _find_anchor(best_chain.moments, pref_hit)
+        ctx.anchor_moment = find_anchor_moment(best_chain.moments, pref_hit)
+        # Fallback 1: 跨链查找（含 frozen chain 的 moment）
+        if ctx.anchor_moment is None:
+            ctx.anchor_moment = _find_anchor_across_chains(chains, pref_hit)
+        # Fallback 2: 创建公共前缀 frozen chain
+        if ctx.anchor_moment is None and store:
+            ctx.anchor_moment = _ensure_frozen_chain(
+                store, best_chain, pref_hit,
+                session_id, ctx.family_key or "",
+            )
         new_msgs = all_msgs_c[pref_hit:]
         ctx.new_char_count = compute_char_count(new_msgs)
 

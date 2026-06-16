@@ -28,3 +28,20 @@ class Chain:
     sys_hashes: str = ""
     tools_hashes: str = ""
     messages_hashes: str = ""
+
+
+def find_anchor_moment(moments: list[ChainMoment], pref_hit: int) -> ChainMoment | None:
+    """找到 messages_count ≤ pref_hit 的最新 Moment。
+
+    用于 est 计算：moment 的全部消息都被当前前缀覆盖时，
+    moment.total_tokens ≈ 当前请求的缓存命中 token。
+
+    moments 必须按 messages_count 升序排列。
+    """
+    best = None
+    for m in moments:
+        if m.messages_count <= pref_hit:
+            best = m
+        else:
+            break
+    return best

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from deepseek_tap_proxy.pipeline import Stage, Context
-from deepseek_tap_proxy.shared.chain import ChainMoment
+from deepseek_tap_proxy.shared.chain import ChainMoment, find_anchor_moment
 from deepseek_tap_proxy.shared.stages.helpers import compute_char_count
 
 log = logging.getLogger("deepseek-tap")
@@ -81,7 +81,11 @@ class CompactionLockStage(Stage):
         # 4. 锚点定位
         pref_hit = shift + len(pure_hashes)
         ctx.meta["pref_hit_count"] = pref_hit
-        ctx.anchor_moment = _find_anchor(matched_chain.moments, pref_hit)
+        # 修复：压缩请求 sys/tools 与旧链一致（SysToolsLock 保证），显示为全命中
+        ctx.meta["pref_sys_hit"] = len(ctx.sys)
+        ctx.meta["pref_tools_hit"] = len(ctx.tools)
+        ctx.meta["pref_msgs_hit"] = pref_hit
+        ctx.anchor_moment = find_anchor_moment(matched_chain.moments, pref_hit)
         ctx.new_char_count = compute_char_count([msgs_c[-1]])
 
         log.info("[%s] compaction locked: shift=%d, pref_hit=%d, chain=%s",
@@ -124,12 +128,5 @@ def _find_anchor_from_dict(chain: dict, pref_hit: int) -> ChainMoment | None:
     return best
 
 
-def _find_anchor(moments: list[ChainMoment], pref_hit: int) -> ChainMoment | None:
-    """找到 messages_count ≤ pref_hit 的最大 Moment。"""
-    best = None
-    for m in moments:
-        if m.messages_count <= pref_hit:
-            best = m
-        else:
-            break
-    return best
+# Backward-compat alias (logic moved to chain.find_anchor_moment)
+_find_anchor = find_anchor_moment
