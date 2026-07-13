@@ -62,6 +62,8 @@ class SysToolsLockStage(Stage):
 
         if not has_canon_sys and not has_canon_tools:
             if not cur_sys and not cur_tools:
+                ctx.meta["sys_tools_locked"] = "pass"
+                ctx.persist.sys_tools_locked = "pass"
                 return ctx
             # init: write canonical to MemoryStore
             store.set_canonical(session_id,

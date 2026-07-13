@@ -13,7 +13,17 @@ from __future__ import annotations
 
 import asyncio
 import threading
+
+
+def _coerce_keys(obj):
+    """Recursively coerce dict keys to str for orjson compatibility."""
+    if isinstance(obj, dict):
+        return {str(k): _coerce_keys(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_coerce_keys(item) for item in obj]
+    return obj
 import json
+import orjson
 import time
 from datetime import datetime as dt, timezone
 from pathlib import Path
@@ -396,7 +406,7 @@ class TraceWriter:
             record["run_id"] = self.run_id
             offset = self._file.tell()
             self._file.write(
-                orjson.dumps(record).decode() + "\n"
+                orjson.dumps(_coerce_keys(record)).decode() + "\n"
             )
             self._file.flush()
             self.count += 1

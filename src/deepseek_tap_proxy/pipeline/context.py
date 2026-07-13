@@ -174,8 +174,7 @@ class Context:
                 for item in system:
                     if isinstance(item, dict) and item.get("type") == "text":
                         txt = item.get("text", "")
-                        if txt:
-                            result.append({"role": "system", "content": txt})
+                        result.append({"role": "system", "content": txt})
                 return result
             return []
         return []

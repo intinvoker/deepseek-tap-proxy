@@ -106,10 +106,15 @@ class AnthropicParseStage(Stage):
 
 
 class AnthropicBlock0ClearStage(Stage):
-    """Clear first system block text for cache stability.
+    """Clear billing header in first system block for cache stability.
 
-    Reads original system from body_readonly, empties block[0].text in fwd_body.
+    Only clears sys[0].text when it starts with the known billing header
+    prefix (``x-anthropic-billing-header:``).  Non-billing sys[0] blocks
+    (Hermes persona, Claude Code prompts, etc.) are left untouched so
+    their prefix cache matches are preserved.
     """
+
+    _BILLING_PREFIX = "x-anthropic-billing-header:"
 
     async def process(self, ctx: Context) -> Context:
         if not isinstance(ctx.body_readonly, dict):
@@ -121,6 +126,10 @@ class AnthropicBlock0ClearStage(Stage):
         if not isinstance(block0, dict) or not isinstance(block0.get("text"), str):
             return ctx
         if not block0["text"]:
+            return ctx
+
+        # Only clear when sys[0] is really a billing header
+        if not block0["text"].startswith(self._BILLING_PREFIX):
             return ctx
 
         if ctx.fwd_body is None and ctx.body_readonly is not None:
@@ -192,21 +201,27 @@ class AnthropicUpstreamPathStage(Stage):
         req_path = ctx.request.path_qs
         if req_path.startswith("/anthropic"):
             req_path = req_path[len("/anthropic"):]
-        # Strip query string for path matching
-        clean_path = req_path.split("?", 1)[0].rstrip("/")
+
+        # 分离路径和查询字符串，分别处理
+        clean_path = req_path
+        query_str = ""
+        if "?" in req_path:
+            clean_path, query_str = req_path.split("?", 1)
+            query_str = "?" + query_str
+        clean_path = clean_path.rstrip("/")
 
         path_prefix = upstream.path_prefix if upstream else None
 
         if path_prefix and not clean_path.startswith(path_prefix.rstrip("/")):
             # path_prefix 存在且 clean_path 尚未包含前缀 → 加上
-            ctx.upstream_url = target.rstrip("/") + path_prefix + clean_path
+            ctx.upstream_url = target.rstrip("/") + path_prefix + clean_path + query_str
             log.debug(
                 f"[{ctx.req_id}] upstream path: "
                 f"{target} + {path_prefix} + ... → {ctx.upstream_url}"
             )
         elif path_prefix and clean_path.startswith(path_prefix.rstrip("/")):
             # path_prefix 存在且 clean_path 已包含前缀 → 直接用 clean_path
-            ctx.upstream_url = target.rstrip("/") + clean_path
+            ctx.upstream_url = target.rstrip("/") + clean_path + query_str
         else:
             # 无 path_prefix → 保留 /anthropic 路径
             ctx.upstream_url = target.rstrip("/") + "/anthropic" + req_path
