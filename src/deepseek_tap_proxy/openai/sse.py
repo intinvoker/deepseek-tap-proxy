@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import orjson
 
 from deepseek_tap_proxy.shared.sse_parser import SSEEvent, SSEParser
 from deepseek_tap_proxy.openai.usage import normalize_usage
@@ -20,8 +21,8 @@ class OpenaiReconstructor:
 
     def _process_event(self, event: SSEEvent) -> None:
         try:
-            data = json.loads(event.data)
-        except (json.JSONDecodeError, ValueError):
+            data = orjson.loads(event.data)
+        except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
             data = event.data
         self.events.append({"event": event.event_type or "message", "data": data})
         if isinstance(data, dict):

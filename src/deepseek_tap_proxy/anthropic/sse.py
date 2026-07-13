@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import orjson
 
 from deepseek_tap_proxy.shared.sse_parser import SSEEvent, SSEParser
 
@@ -21,8 +22,8 @@ class AnthropicReconstructor:
     def _process_event(self, event: SSEEvent) -> None:
         event_type = event.event_type or "message"
         try:
-            data = json.loads(event.data)
-        except (json.JSONDecodeError, ValueError):
+            data = orjson.loads(event.data)
+        except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
             data = event.data
         self.events.append({"event": event_type, "data": data})
         if isinstance(data, dict):
@@ -63,8 +64,8 @@ class AnthropicReconstructor:
                 block = self._snapshot["content"][idx]
                 if "_partial" in block:
                     try:
-                        block["input"] = json.loads(block.pop("_partial"))
-                    except (json.JSONDecodeError, ValueError):
+                        block["input"] = orjson.loads(block.pop("_partial"))
+                    except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
                         pass
         elif event_type == "message_delta":
             delta = data.get("delta", {})

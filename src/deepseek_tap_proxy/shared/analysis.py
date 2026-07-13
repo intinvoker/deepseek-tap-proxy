@@ -32,7 +32,7 @@ def detect_client_type_openai(msgs: list[dict]) -> str:
     # and compaction requests alike).  The first message may be either the
     # agent prompt or the compaction instruction.
     if isinstance(c1, str) and "<environment_info>" in c1:
-        return "copilot-agent"
+        return "vscode-copilot"
     if isinstance(c0, str) and msgs[0].get("role") == "system":
         return "hermes"
     return "generic"
@@ -42,7 +42,7 @@ def detect_client_type_openai(msgs: list[dict]) -> str:
 
 def detect_intent_openai(client_type: str, msgs: list[dict]) -> str:
     """Detect request intent. Only copilot + specific msg[0] triggers compaction."""
-    if client_type not in ("copilot", "copilot-agent"):
+    if client_type not in ("vscode-copilot", "vscode-copilot-deepseek"):
         return "normal"
     if not msgs:
         return "normal"
@@ -90,7 +90,7 @@ def resolve_session_openai(msgs: list[dict]) -> Session:
     """
     client_type = detect_client_type_openai(msgs)
 
-    if client_type in ("copilot", "copilot-agent"):
+    if client_type in ("vscode-copilot", "vscode-copilot-deepseek"):
         uuid = extract_copilot_uuid(msgs[0].get("content", "") if msgs else "")
         fingerprint = _compute_fingerprint(msgs, 1, 2) or "unknown"
         key = uuid or fingerprint

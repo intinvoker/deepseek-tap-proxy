@@ -8,6 +8,7 @@ Replay:  TraceTransport(trace_response) → trace JSON (Inspector 侧)
 from __future__ import annotations
 
 import json
+import orjson
 import logging
 from dataclasses import dataclass, field
 
@@ -67,7 +68,7 @@ class AiohttpTransport(Transport):
 
         body_bytes = None
         if ctx.fwd_body is not None:
-            body_bytes = json.dumps(ctx.fwd_body, ensure_ascii=False).encode("utf-8")
+            body_bytes = orjson.dumps(ctx.fwd_body)
             ctx.fwd_headers["Content-Length"] = str(len(body_bytes))
         else:
             ctx.fwd_headers.pop("Content-Length", None)
@@ -117,8 +118,8 @@ class AiohttpTransport(Transport):
         body = None
         if decode_bytes:
             try:
-                body = json.loads(decode_bytes)
-            except (json.JSONDecodeError, ValueError):
+                body = orjson.loads(decode_bytes)
+            except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
                 pass
 
         return TransportResponse(

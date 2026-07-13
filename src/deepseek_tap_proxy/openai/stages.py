@@ -10,6 +10,7 @@ import collections.abc
 import copy
 import json
 import logging
+import orjson
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,14 +119,14 @@ class ParseStage(Stage):
         ctx.fwd_headers = fwd_headers
 
         try:
-            parsed = json.loads(body) if body else None
-        except (json.JSONDecodeError, ValueError):
+            parsed = orjson.loads(body) if body else None
+        except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
             parsed = None
 
         # body_readonly: set once, never modified (used for trace/debug)
         ctx.body_readonly = parsed
         if isinstance(parsed, dict):
-            ctx.fwd_body = copy.deepcopy(parsed)
+            ctx.fwd_body = orjson.loads(orjson.dumps(parsed))  # orjson 比 deepcopy 快 ~3×
         else:
             ctx.fwd_body = parsed
 
@@ -243,7 +244,7 @@ class ForwardStage(Stage):
         ctx.resp_bytes = resp_bytes
 
         try:
-            resp_body = json.loads(resp_bytes) if resp_bytes else None
+            resp_body = orjson.loads(resp_bytes) if resp_bytes else None
         except (json.JSONDecodeError, ValueError):
             resp_body = None
         ctx.resp_body = resp_body
@@ -278,7 +279,7 @@ class ReturnStage(Stage):
                     idx = content.index("<summary>") + len("<summary>")
                     ctx.resp_body["choices"][0]["message"]["content"] = content[idx:].strip()
                 # Rebuild response bytes
-                new_body = json.dumps(ctx.resp_body, ensure_ascii=False).encode("utf-8")
+                new_body = orjson.dumps(ctx.resp_body)
                 ctx.response = web.Response(
                     status=ctx.response.status,
                     headers=dict(ctx.response.headers),

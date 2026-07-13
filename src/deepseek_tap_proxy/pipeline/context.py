@@ -12,6 +12,8 @@ Canonical form（格式无关视图）::
 from __future__ import annotations
 
 import copy
+import json
+import orjson
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -22,11 +24,41 @@ from typing import Optional
 
 from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
 from deepseek_tap_proxy.shared.persist import PersistRecord
-from deepseek_tap_proxy.shared.hash import msg_hash
 from deepseek_tap_proxy.pipeline.chain_action import ChainAction
 from deepseek_tap_proxy.pipeline.snapshot import SysToolsSnapshot
 
 REQUEST_ID_LENGTH = 12
+
+
+class MessageIndex:
+    """dict 对象 → (hash, char_count) 的附属映射。
+
+    同一个 dict 对象只做一次 json.dumps，后续零开销读取。
+    使用 id(dict) 索引，同时持有 dict 引用防止 id 复用。
+    生命周期 = 一次 HTTP 请求（挂在 Context 上，请求结束自动释放）。
+    """
+
+    def __init__(self):
+        # id → (msg_ref, hash, char_count)
+        # msg_ref 保持引用，防止 id 复用导致碰撞
+        self._idx: dict[int, tuple[dict, str, int]] = {}
+        self.hits: int = 0       # 缓存命中次数
+        self.misses: int = 0     # json.dumps 次数
+
+    def get(self, msg: dict) -> tuple[str, int]:
+        """返回 (hash_hex, char_count)。首次 json.dumps，后续读缓存。"""
+        mid = id(msg)
+        entry = self._idx.get(mid)
+        if entry is not None and entry[0] is msg:
+            self.hits += 1
+            return entry[1], entry[2]
+        # 新 dict 或 id 碰撞（极罕见）：计算并缓存
+        self.misses += 1
+        raw = orjson.dumps(msg)
+        h = xxhash.xxh3_64(raw).hexdigest()[:16]
+        cc = len(raw)
+        self._idx[mid] = (msg, h, cc)
+        return h, cc
 
 
 @dataclass
@@ -73,10 +105,18 @@ class Context:
     orig_tools_len: int = 0
     orig_msgs_len: int = 0
 
+    # ── 对象的附属索引：dict 对象 → (hash, char_count)，零拷贝 ──
+    _msg_index: MessageIndex = field(default_factory=MessageIndex)
+
     # ── 三段 hash（原生 list[str]，view setter 自动刷新）──
     _sys_hashes: list[str] = field(default_factory=list)
     _tools_hashes: list[str] = field(default_factory=list)
     _messages_hashes: list[str] = field(default_factory=list)
+
+    # ── 三段 char_count（与 hash 同步计算，用于替代 compute_char_count）──
+    _sys_char_counts: list[int] = field(default_factory=list)
+    _tools_char_counts: list[int] = field(default_factory=list)
+    _messages_char_counts: list[int] = field(default_factory=list)
 
     # ── 分支族标识（sys_hashes + tools_hashes → streaming xxh3_64）──
     family_key: str = ""
@@ -93,7 +133,8 @@ class Context:
         self._t0 = time.monotonic()
         self.req_id = f"req_{uuid.uuid4().hex[:REQUEST_ID_LENGTH]}"
         if self.fwd_body is None and self.body_readonly is not None:
-            self.fwd_body = copy.deepcopy(self.body_readonly)
+            # json roundtrip 比 deepcopy 快 ~2.5×（body 是 JSON 原生类型）
+            self.fwd_body = orjson.loads(orjson.dumps(self.body_readonly))
 
     @property
     def elapsed_ms(self) -> int:
@@ -241,19 +282,45 @@ class Context:
     def _on_sys_changed(self):
         s = self.sys
         self.orig_sys_len = len(s)
-        self._sys_hashes = [msg_hash(m) for m in s]
+        self._sys_hashes = []
+        self._sys_char_counts = []
+        for m in s:
+            h, cc = self._msg_index.get(m)
+            self._sys_hashes.append(h)
+            self._sys_char_counts.append(cc)
         self._recompute_family_key()
 
     def _on_tools_changed(self):
         t = self.tools
         self.orig_tools_len = len(t)
-        self._tools_hashes = [msg_hash(m) for m in t]
+        self._tools_hashes = []
+        self._tools_char_counts = []
+        for m in t:
+            h, cc = self._msg_index.get(m)
+            self._tools_hashes.append(h)
+            self._tools_char_counts.append(cc)
         self._recompute_family_key()
 
     def _on_messages_changed(self):
         m = self.messages
         self.orig_msgs_len = len(m)
-        self._messages_hashes = [msg_hash(m) for m in m]
+        self._messages_hashes = []
+        self._messages_char_counts = []
+        for m in m:
+            h, cc = self._msg_index.get(m)
+            self._messages_hashes.append(h)
+            self._messages_char_counts.append(cc)
+
+    def char_count_of(self, items: list[dict]) -> int:
+        """返回任意 list[dict] 的 char_count，使用 MessageIndex 缓存。"""
+        return sum(self._msg_index.get(m)[1] for m in items)
+
+    @property
+    def total_char_count(self) -> int:
+        """三段 char_count 总和（替代 compute_char_count）。"""
+        return (sum(self._sys_char_counts) +
+                sum(self._tools_char_counts) +
+                sum(self._messages_char_counts))
 
     def _recompute_family_key(self):
         """Streaming xxh3_64 over sys_hashes + tools_hashes → 16-char hex."""

@@ -17,7 +17,7 @@ class ProxyConfig:
     lock_mode: str = "prefix"
     strip_user_id: bool = True
     lock_sys_tools: bool = True
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
     log_file: str = ""  # 日志文件路径，留空则自动设为 data/proxy.log
     upstreams_config: str = ""  # path to upstreams.yaml, empty = router disabled
     otlp_log_dir: str = ""  # 废弃，由 server.py 从 trace_dir 派生

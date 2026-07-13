@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import orjson
 from datetime import datetime, timezone
 
 from deepseek_tap_proxy.pipeline.chain_action import ChainAction
 from deepseek_tap_proxy.shared.chain import Chain, ChainMoment, find_anchor_moment
+
+log = logging.getLogger("deepseek-tap")
 
 
 def compute_char_count(messages: list[dict]) -> int:
@@ -24,8 +28,8 @@ def json_list(raw) -> list[dict]:
     if not raw:
         return []
     try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        return orjson.loads(raw)
+    except (orjson.JSONDecodeError, json.JSONDecodeError, TypeError):
         return []
 
 
@@ -68,7 +72,6 @@ def create_chain(ctx, all_msgs_c: list[dict], hit_count: int) -> ChainAction:
     Returns the created ChainAction (also set on ctx.chain_action).
     """
     from deepseek_tap_proxy.shared.prefix import make_chain_id, compute_safe_breakpoints
-    from deepseek_tap_proxy.shared.stages.helpers import compute_char_count as _ccc
 
     _all_hashes = ctx.sys_hashes + ctx.tools_hashes + ctx.messages_hashes
     ctx.chain_action = ChainAction(
@@ -84,7 +87,7 @@ def create_chain(ctx, all_msgs_c: list[dict], hit_count: int) -> ChainAction:
         safe_breakpoints=compute_safe_breakpoints(all_msgs_c),
         hit_count=hit_count,
         chain_tokens=0,
-        char_count=_ccc(all_msgs_c),
+        char_count=ctx.char_count_of(all_msgs_c),
     )
     ctx.persist.chain_id = ctx.chain_action.chain_id
     ctx.persist.chain_action = ctx.chain_action.action
@@ -112,9 +115,9 @@ def persist_chain_nowait(ctx, _db=None) -> None:
     store: MemoryStore | None = rt.store if rt else None
     chain_tokens = ctx.persist.total_input_tokens or ctx.meta.get("prompt_tokens", 0)
 
-    sys_json = json.dumps(ca.sys or ctx.sys)
-    tools_json = json.dumps(ca.tools or ctx.tools)
-    msgs_json = json.dumps(ca.messages or ctx.messages)
+    sys_json = orjson.dumps(ca.sys or ctx.sys).decode()
+    tools_json = orjson.dumps(ca.tools or ctx.tools).decode()
+    msgs_json = orjson.dumps(ca.messages or ctx.messages).decode()
     sys_hashes = ca.sys_hashes or ctx.sys_hash_chain
     tools_hashes = ca.tools_hashes or ctx.tools_hash_chain
     msgs_hashes = ca.messages_hashes or ctx.messages_hash_chain
@@ -151,7 +154,7 @@ def persist_chain_nowait(ctx, _db=None) -> None:
     s_len = len(ca.sys) if ca.sys else len(ctx.sys)
     t_len = len(ca.tools) if ca.tools else len(ctx.tools)
     m_len = len(ca.messages) if ca.messages else len(ctx.messages)
-    print(green(
+    log.debug(green(
         f"  [chain] {tag}: {ca.chain_id[:16]}... "
         f"(s={s_len} t={t_len} m={m_len}, hit={ca.hit_count})"
     ))
@@ -173,13 +176,18 @@ def create_chain_moment(ctx, store) -> None:
     op = "compact" if ctx.chat_type == "compaction" else (
         ctx.chain_action.action if ctx.chain_action else "create"
     )
+    # TUI 对齐: messages_count = conversation messages only（不含 sys/tools）
+    # 确保 find_anchor_moment(pref_hit) 比较时单位一致：
+    #   pref_hit = sys_fc + tools_fc + msg_fc + msg_bc（hash 命中数）
+    #   messages_count = len(ctx.messages)（对话消息数）
+    #   当 tools 全匹配时两者中 tools 部分抵消，剩余 msg_fc vs msg_count
     moment = ChainMoment(
-        messages_count=len(ctx.sys) + len(ctx.tools) + len(ctx.messages),
+        messages_count=len(ctx.messages),
         op=op,
         total_tokens=(ctx.persist.total_input_tokens or 0) + (ctx.persist.output_tokens or 0),
         cache_hit_tokens=ctx.persist.cache_hit_tokens or 0,
         cache_miss_tokens=ctx.persist.cache_miss_tokens or 0,
-        char_count=compute_char_count(ctx.sys + ctx.tools + ctx.messages),
+        char_count=ctx.total_char_count,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -224,9 +232,9 @@ def _ensure_chain_exists(ctx, store, chain_id: str) -> None:
     if chain_record:
         return  # Already exists in memory
 
-    sys_json = json.dumps(ctx.sys, ensure_ascii=False)
-    tools_json = json.dumps(ctx.tools, ensure_ascii=False)
-    msgs_json = json.dumps(ctx.messages, ensure_ascii=False)
+    sys_json = orjson.dumps(ctx.sys).decode()
+    tools_json = orjson.dumps(ctx.tools).decode()
+    msgs_json = orjson.dumps(ctx.messages).decode()
     sys_hashes = ctx.sys_hash_chain
     tools_hashes = ctx.tools_hash_chain
     msgs_hashes = ctx.messages_hash_chain
@@ -302,7 +310,11 @@ def _ensure_frozen_chain(
         return None
 
     smallest = min(ref_chain.moments, key=lambda m: m.messages_count)
-    if smallest.messages_count <= pref_hit:
+    # ── full count = conversation msgs + sys + tools（对齐 pref_hit 三段的比较单位）──
+    _ref_sys_len = len(ref_chain.sys)
+    _ref_tools_len = len(ref_chain.tools)
+    full_smallest = smallest.messages_count + _ref_sys_len + _ref_tools_len
+    if full_smallest <= pref_hit:
         return None  # _find_anchor 应该已经找到了
 
     # ── 1. 检查 idempotent：是否已存在同 family + 同长度的 frozen chain ──
@@ -315,9 +327,12 @@ def _ensure_frozen_chain(
                 return anchor  # 已存在，直接消费
 
     # ── 2. 估算前缀 moment ──
-    ratio = pref_hit / smallest.messages_count
+    # 比例基于 full count（含 sys+tools），因为 pref_hit 也含三段 hash 命中
+    ratio = pref_hit / full_smallest
+    # 对话消息数 = 总前缀位置 - sys - tools
+    conv_count = max(0, pref_hit - _ref_sys_len - _ref_tools_len)
     estimated = ChainMoment(
-        messages_count=pref_hit,
+        messages_count=conv_count,
         op="create",
         total_tokens=int(smallest.total_tokens * ratio),
         cache_hit_tokens=int((smallest.cache_hit_tokens or 0) * ratio),
@@ -363,16 +378,16 @@ def _ensure_frozen_chain(
     # ── 5. 持久化 frozen chain + moment ──
     store.upsert_chain(
         session_id, frozen_chain_id,
-        sys=json.dumps(prefix_sys),
-        tools=json.dumps(prefix_tools),
-        messages=json.dumps(prefix_msgs),
+        sys=orjson.dumps(prefix_sys).decode(),
+        tools=orjson.dumps(prefix_tools).decode(),
+        messages=orjson.dumps(prefix_msgs).decode(),
         sys_hashes=sys_hashes_str,
         tools_hashes=tools_hashes_str,
         messages_hashes=msgs_hashes_str,
         msg_count=pref_hit,
         is_frozen=True,
         family_key=family_key,
-        moments=json.dumps([{
+        moments=orjson.dumps([{
             "messages_count": estimated.messages_count,
             "op": estimated.op,
             "total_tokens": estimated.total_tokens,

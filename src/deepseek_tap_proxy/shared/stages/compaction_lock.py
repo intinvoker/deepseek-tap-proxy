@@ -11,9 +11,9 @@
 from __future__ import annotations
 import json
 import logging
+import orjson
 from deepseek_tap_proxy.pipeline import Stage, Context
 from deepseek_tap_proxy.shared.chain import ChainMoment, find_anchor_moment
-from deepseek_tap_proxy.shared.stages.helpers import compute_char_count
 
 log = logging.getLogger("deepseek-tap")
 
@@ -24,7 +24,7 @@ class CompactionLockStage(Stage):
     async def process(self, ctx: Context) -> Context:
         if ctx.chat_type != "compaction":
             return ctx
-        if ctx.client_type not in ("copilot", "copilot-agent"):
+        if ctx.client_type not in ("vscode-copilot", "vscode-copilot-deepseek"):
             return ctx
 
         session_id = ctx.session_id
@@ -86,7 +86,7 @@ class CompactionLockStage(Stage):
         ctx.meta["pref_tools_hit"] = len(ctx.tools)
         ctx.meta["pref_msgs_hit"] = pref_hit
         ctx.anchor_moment = find_anchor_moment(matched_chain.moments, pref_hit)
-        ctx.new_char_count = compute_char_count([msgs_c[-1]])
+        ctx.new_char_count = ctx.char_count_of([msgs_c[-1]])
 
         log.info("[%s] compaction locked: shift=%d, pref_hit=%d, chain=%s",
                  ctx.req_id, shift, pref_hit, matched_chain.chain_id[:16])
@@ -98,8 +98,8 @@ def _find_anchor_from_dict(chain: dict, pref_hit: int) -> ChainMoment | None:
     moments_json = chain.get("moments", "[]")
     if isinstance(moments_json, str):
         try:
-            moments_data = json.loads(moments_json)
-        except (json.JSONDecodeError, TypeError):
+            moments_data = orjson.loads(moments_json)
+        except (orjson.JSONDecodeError, json.JSONDecodeError, TypeError):
             moments_data = []
     elif isinstance(moments_json, list):
         moments_data = moments_json

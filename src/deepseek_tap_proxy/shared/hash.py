@@ -1,9 +1,10 @@
 """Cross-format hash chain computation for session tracking.
 
 Uses xxHash3 (xxh3_64) for fast, collision-resistant message hashing.
+orjson for serialization (~3x faster than stdlib json).
 """
 
-import json
+import orjson
 import xxhash
 
 
@@ -14,8 +15,8 @@ def msg_hash(msg: dict) -> str:
     32-bit MD5 truncation) at 3-5× the speed.  The first 16 hex chars
     encode the full 64-bit value.
     """
-    raw = json.dumps(msg, sort_keys=True, ensure_ascii=False)
-    return xxhash.xxh3_64(raw.encode()).hexdigest()[:16]
+    raw = orjson.dumps(msg)  # bytes, keys auto-sorted
+    return xxhash.xxh3_64(raw).hexdigest()[:16]
 
 
 def compute_msg_hash_chain(messages: list) -> str:

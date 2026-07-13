@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import orjson
 
 from deepseek_tap_proxy.pipeline import Stage, Context, SysToolsSnapshot, LockSegment
 from deepseek_tap_proxy.shared.store import MemoryStore
@@ -39,7 +40,7 @@ class SysToolsLockStage(Stage):
         session_id = ctx.session_id
         if not session_id:
             return ctx
-        if ctx.client_type not in ("copilot", "copilot-agent", "claude-code"):
+        if ctx.client_type not in ("vscode-copilot", "vscode-copilot-deepseek", "claude-code"):
             return ctx
 
         store: MemoryStore | None = rt.store if rt else None
@@ -51,8 +52,8 @@ class SysToolsLockStage(Stage):
         sys_before_len = len(cur_sys)
         tools_before_len = len(cur_tools)
 
-        cur_sys_json = json.dumps(cur_sys, separators=(",", ":"), ensure_ascii=False)
-        cur_tools_json = json.dumps(cur_tools, separators=(",", ":"), ensure_ascii=False)
+        cur_sys_json = orjson.dumps(cur_sys).decode()
+        cur_tools_json = orjson.dumps(cur_tools).decode()
 
         # Read canonical from MemoryStore (0 I/O, session-level)
         canon = store.get_canonical(session_id)
@@ -82,12 +83,12 @@ class SysToolsLockStage(Stage):
         needs_lock = False
 
         if has_canon_sys:
-            canon_sys = json.loads(canon["sys"])
+            canon_sys = orjson.loads(canon["sys"])
             if cur_sys != canon_sys:
                 restored_sys = canon_sys
                 needs_lock = True
         if has_canon_tools:
-            canon_tools = json.loads(canon["tools"])
+            canon_tools = orjson.loads(canon["tools"])
             if cur_tools != canon_tools:
                 restored_tools = canon_tools
                 needs_lock = True

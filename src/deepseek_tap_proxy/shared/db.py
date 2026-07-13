@@ -11,6 +11,7 @@ and properties, never from raw format-specific structures.
 from __future__ import annotations
 
 import json
+import orjson
 import sqlite3
 from datetime import datetime, timezone
 
@@ -111,7 +112,7 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
     ``moments`` is a JSON array of Moment dicts.
     """
     now = datetime.now(timezone.utc).isoformat()
-    safe_breakpoints_json = json.dumps(safe_breakpoints) if safe_breakpoints is not None else None
+    safe_breakpoints_json = orjson.dumps(safe_breakpoints).decode() if safe_breakpoints is not None else None
     conn.execute("""
         INSERT INTO prefix_chains
             (session_id, chain_id, sys, tools, messages,

@@ -6,6 +6,7 @@ import asyncio
 import collections.abc
 import json
 import logging
+import orjson
 
 from datetime import datetime, timezone
 
@@ -53,7 +54,7 @@ class AnthropicParseStage(Stage):
 
         if raw_body:
             try:
-                parsed = json.loads(raw_body)
+                parsed = orjson.loads(raw_body)
                 ctx.body_readonly = parsed
                 if isinstance(parsed, dict):
                     ctx.fwd_body = dict(parsed)  # 浅拷贝比 deepcopy 快 N 倍
@@ -62,7 +63,7 @@ class AnthropicParseStage(Stage):
                 # ── 规范形式 view 就绪 ──
                 ctx.format = "anthropic"
                 ctx.is_streaming = parsed.get("stream", False) if isinstance(parsed, dict) else False
-            except (json.JSONDecodeError, ValueError):
+            except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
                 ctx.should_abort = True
                 ctx.response = web.Response(status=400, text="Invalid JSON")
                 return ctx
@@ -292,8 +293,8 @@ class AnthropicForwardStage(Stage):
             except Exception:
                 pass
         try:
-            ctx.resp_body = json.loads(decode_bytes) if decode_bytes else None
-        except (json.JSONDecodeError, ValueError):
+            ctx.resp_body = orjson.loads(decode_bytes) if decode_bytes else None
+        except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
             ctx.resp_body = None
         if ctx.resp_body:
             ctx.meta["usage"] = normalize_anthropic_usage(ctx.resp_body.get("usage", {}))

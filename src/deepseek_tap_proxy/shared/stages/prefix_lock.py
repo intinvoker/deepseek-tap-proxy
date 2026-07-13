@@ -16,7 +16,7 @@ from deepseek_tap_proxy.pipeline import Stage, Context, ChainAction
 from deepseek_tap_proxy.shared.chain import Chain
 from deepseek_tap_proxy.shared.store import MemoryStore
 from deepseek_tap_proxy.shared.stages.helpers import (
-    compute_char_count, json_list, chain_hash_view, find_chain_result, create_chain,
+    json_list, chain_hash_view, find_chain_result, create_chain,
     _find_anchor_across_chains, _ensure_frozen_chain,
 )
 from deepseek_tap_proxy.shared.chain import find_anchor_moment
@@ -239,7 +239,7 @@ class PrefixLockStage(Stage):
                 session_id, ctx.family_key or "",
             )
         new_msgs = all_msgs_c[pref_hit:]
-        ctx.new_char_count = compute_char_count(new_msgs)
+        ctx.new_char_count = ctx.char_count_of(new_msgs)
 
         # 从 anchor_moment 获取 tokens 用于 chain_action
         chain_tokens = ctx.anchor_moment.total_tokens if ctx.anchor_moment else 0
@@ -265,7 +265,7 @@ class PrefixLockStage(Stage):
 
         from deepseek_tap_proxy.shared.prefix import make_chain_id
 
-        cc = compute_char_count(locked_sys + locked_tools + locked_msgs)
+        cc = ctx.total_char_count  # setter 写回后自动更新
 
         # All chains are mutable (is_frozen removed); always extend when longer
         if len(all_msgs_c) > len(all_msgs_p):
@@ -286,7 +286,7 @@ class PrefixLockStage(Stage):
                 sys_hashes=ctx.sys_hash_chain, tools_hashes=ctx.tools_hash_chain,
                 messages_hashes=ctx.messages_hash_chain,
                 sys=ctx.sys, tools=ctx.tools, messages=ctx.messages,
-                hit_count=0, chain_tokens=0, char_count=compute_char_count(all_msgs_c),
+                hit_count=0, chain_tokens=0, char_count=ctx.char_count_of(all_msgs_c),
             )
         ctx.persist.chain_id = ctx.chain_action.chain_id
         ctx.persist.chain_action = ctx.chain_action.action

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from aiohttp import web
 
-from deepseek_tap_proxy.pipeline import Context, Pipeline, Stage
+from deepseek_tap_proxy.pipeline import Context
 from deepseek_tap_proxy.router import ResolvedTarget
 
 
@@ -49,6 +49,7 @@ def estimate_tokens(body: dict | None) -> int:
 async def handle_count_tokens(ctx: Context) -> Context:
     """先尝试上游，失败则 fallback 本地估算。"""
     import json
+    import orjson
     import aiohttp
 
     upstream = ctx.request.get("upstream")
@@ -63,7 +64,7 @@ async def handle_count_tokens(ctx: Context) -> Context:
                 url = target.rstrip("/") + upstream.path_prefix.rstrip("/") + "/messages/count_tokens"
                 fwd_body = ctx.fwd_body or ctx.body_readonly
                 if fwd_body:
-                    body_bytes = json.dumps(fwd_body, ensure_ascii=False).encode()
+                    body_bytes = orjson.dumps(fwd_body)
                 else:
                     body_bytes = b"{}"
                 async with session.post(
@@ -91,45 +92,10 @@ async def handle_count_tokens(ctx: Context) -> Context:
 
     return ctx
 from deepseek_tap_proxy.shared.consumers import store_phase1, run_consumers
-from deepseek_tap_proxy.shared.stages import (
-    CanonicalStage, SysToolsLockStage, RequestAnalysisStage,
-)
 from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait, create_chain_moment
-from deepseek_tap_proxy.anthropic.stages import (
-    AnthropicParseStage, AnthropicBlock0ClearStage,
-    AnthropicSystemRoleConvertStage,
-    AnthropicUpstreamPathStage, AnthropicForwardStage, ReturnStage,
-)
+from deepseek_tap_proxy.anthropic.stages import AnthropicParseStage
 
 log = logging.getLogger("deepseek-tap")
-
-
-# ── Pipeline 定义 ──────────────────────────────────────────────────────────
-
-FULL_ANTHROPIC: list[type[Stage]] = [
-    AnthropicParseStage,
-    AnthropicBlock0ClearStage,
-    CanonicalStage,
-    RequestAnalysisStage,
-    SysToolsLockStage,
-    AnthropicSystemRoleConvertStage,
-    AnthropicUpstreamPathStage,
-    AnthropicForwardStage,
-    ReturnStage,
-]
-
-# RequestAnalysisStage 内部按 ctx.format 分发，所有 client_type 共用同一 pipeline
-ANTHROPIC_SKIP_TABLE: dict[str, set[type[Stage]]] = {
-    "generic": set(),
-}
-
-
-def setup_anthropic_pipelines(app: web.Application) -> None:
-    """启动时构建 Anthropic pipeline。由 server.py 调用。"""
-    from deepseek_tap_proxy.pipeline import PipelineFactory
-    factory = PipelineFactory()
-    factory.build_all(FULL_ANTHROPIC, ANTHROPIC_SKIP_TABLE)
-    app["anthropic_pipeline"] = factory
 
 
 # ── 轻量解析（非 chat topic 用）─────────────────────────────────────────────
@@ -140,14 +106,6 @@ async def _light_parse(ctx: Context) -> bool:
     from deepseek_tap_proxy.anthropic.stages import AnthropicParseStage
     ctx = await AnthropicParseStage().process(ctx)
     return not ctx.should_abort
-
-
-def _get_pipeline(rt):
-    """从 Runtime 的 pipeline_factory 获取 pipeline，fallback 到默认 FULL_ANTHROPIC。"""
-    from deepseek_tap_proxy.pipeline import Pipeline
-    if rt and rt.pipeline_factory:
-        return rt.pipeline_factory.get("generic")
-    return Pipeline(FULL_ANTHROPIC)
 
 
 async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
@@ -184,8 +142,11 @@ async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
     # ── 3. 按 topic 分流 ──
     if ctx.topic == "chat":
         # Chat topic: Parse + pipeline 在 Pipeline 内（AnthropicParseStage 为首 stage）
-        pipeline = _get_pipeline(rt)
-        ctx = await pipeline.execute(ctx)
+        from deepseek_tap_proxy.format.anthropic.pipeline import ANTHROPIC_FORMAT_PIPELINE, ANTHROPIC_FORMAT_TAIL
+        from deepseek_tap_proxy.shared.orchestrate import orchestrate
+        from deepseek_tap_proxy.plugins.registry import ALL_PLUGINS
+
+        ctx = await orchestrate(ctx, ANTHROPIC_FORMAT_PIPELINE, ALL_PLUGINS, ANTHROPIC_FORMAT_TAIL)
 
     else:
         # 非 chat topic: 需要独立 parse（因为不走 pipeline）

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import orjson
 import sqlite3
 import time as _time
 from dataclasses import dataclass, field
@@ -312,7 +313,7 @@ class MemoryStore:
         # Parse moments JSON -> list[ChainMoment]
         moments = []
         try:
-            raw_moments = json.loads(rec.moments or "[]")
+            raw_moments = orjson.loads(rec.moments or "[]")
             for m in raw_moments:
                 moments.append(ChainMoment(
                     messages_count=m.get("messages_count", 0),
@@ -355,7 +356,7 @@ class MemoryStore:
         eventually pass ``ctx.family_key``).
         """
         now = datetime.now(timezone.utc).isoformat()
-        sb_json = json.dumps(safe_breakpoints) if safe_breakpoints is not None else None
+        sb_json = orjson.dumps(safe_breakpoints).decode() if safe_breakpoints is not None else None
 
         if not family_key:
             family_key = self.compute_family_key(sys_hashes, tools_hashes)
@@ -423,7 +424,7 @@ class MemoryStore:
                     if c.chain_id == chain_id:
                         # Parse existing moments
                         try:
-                            moments = json.loads(c.moments or "[]")
+                            moments = orjson.loads(c.moments or "[]")
                         except (json.JSONDecodeError, TypeError):
                             moments = []
                         # Append new moment as dict
@@ -436,7 +437,7 @@ class MemoryStore:
                             "char_count": moment.char_count,
                             "timestamp": moment.timestamp,
                         })
-                        c.moments = json.dumps(moments)
+                        c.moments = orjson.dumps(moments).decode()
                         # Queue SQLite write
                         self._enqueue_moment_persist(chain_id, moments)
                         return
@@ -446,7 +447,7 @@ class MemoryStore:
         def _write(conn, cid, m_json):
             conn.execute(
                 "UPDATE prefix_chains SET moments = ? WHERE chain_id = ?",
-                (json.dumps(m_json), cid),
+                (orjson.dumps(m_json).decode(), cid),
             )
             conn.commit()
 

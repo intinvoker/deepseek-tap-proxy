@@ -15,19 +15,11 @@ import logging
 import aiohttp
 from aiohttp import web
 
-from deepseek_tap_proxy.pipeline import Context, Pipeline
+from deepseek_tap_proxy.pipeline import Context
 from deepseek_tap_proxy.router import ResolvedTarget
-from deepseek_tap_proxy.openai.copilot.compression import CompactionRewrite
-from deepseek_tap_proxy.shared.stages.compaction_lock import CompactionLockStage
-from deepseek_tap_proxy.openai.stages import (
-    ParseStage, ForwardStage, ReturnStage,
-)
-from deepseek_tap_proxy.shared.stages import (
-    CanonicalStage, RequestAnalysisStage,
-    SysToolsLockStage, PrefixLockStage,
-)
 from deepseek_tap_proxy.shared.consumers import run_consumers
 from deepseek_tap_proxy.shared.stages.helpers import persist_chain_nowait, create_chain_moment
+from deepseek_tap_proxy.shared.orchestrate import orchestrate
 
 log: logging.Logger = logging.getLogger("deepseek-tap")
 
@@ -56,17 +48,11 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
     ctx = Context(request=request)
     ctx.target_url = resolved.target_url
 
-    rt = request.get("runtime")
-    config = rt.config if rt else {}
-    lock_mode = getattr(config, "lock_mode", "prefix")
-    lock_sys_tools = getattr(config, "lock_sys_tools", True)
-    prefix_enabled: bool = lock_mode == "prefix"
+    from deepseek_tap_proxy.format.openai.pipeline import OPENAI_FORMAT_PIPELINE, OPENAI_FORMAT_TAIL
+    from deepseek_tap_proxy.shared.orchestrate import orchestrate
+    from deepseek_tap_proxy.plugins.registry import ALL_PLUGINS
 
-    pipeline: Pipeline = _build_pipeline(
-        prefix_enabled=prefix_enabled,
-        lock_sys_tools=lock_sys_tools,
-    )
-    ctx = await pipeline.execute(ctx)
+    ctx = await orchestrate(ctx, OPENAI_FORMAT_PIPELINE, ALL_PLUGINS, OPENAI_FORMAT_TAIL)
     ctx.topic = "chat"  # OpenAI /chat/completions 始终是 chat topic
 
     # ── 前缀链优先持久化 ──
@@ -153,23 +139,3 @@ async def fim_passthrough_handler(request: web.Request) -> web.Response:
                  if k.lower() not in ("transfer-encoding", "content-encoding", "content-length")},
         body=resp_body,
     )
-
-
-def _build_pipeline(prefix_enabled: bool = False, lock_sys_tools: bool = True) -> Pipeline:
-    """Build the OpenAI pipeline using shared stages."""
-    stages = [
-        ParseStage(),
-        CanonicalStage(),
-        RequestAnalysisStage(),
-    ]
-    if lock_sys_tools:
-        stages.append(SysToolsLockStage())
-    if prefix_enabled:
-        stages.append(PrefixLockStage())
-    # CompactionLockStage: strip wrapping → cross-align → restore head → lock
-    stages.append(CompactionLockStage())
-    # CompactionRewrite: replace tail after head is restored
-    stages.append(CompactionRewrite())
-    stages.append(ForwardStage())
-    stages.append(ReturnStage())
-    return Pipeline(stages)
