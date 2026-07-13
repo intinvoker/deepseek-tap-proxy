@@ -20,7 +20,7 @@ def compute_char_count(messages: list[dict]) -> int:
     ``parameters``) that lack a ``content`` field — so the
     ``tokens / chars`` ratio is consistent.
     """
-    return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+    return sum(len(orjson.dumps(m)) for m in messages)
 
 
 def json_list(raw) -> list[dict]:

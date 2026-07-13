@@ -15,7 +15,4 @@ class HermesPlugin:
         return detect_hermes(ctx)
 
     def build_stages(self, ctx: Context) -> list[Stage]:
-        return [
-            SysToolsLockStage(),
-            PrefixLockStage(),
-        ]
+        return []  # Hermes 不需要 Lock stage

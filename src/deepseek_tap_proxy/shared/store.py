@@ -120,6 +120,9 @@ class MemoryStore:
         # session_id → family_key → list[ChainRecord]  (sorted by last_seen desc)
         self._chains: dict[str, dict[str, list[ChainRecord]]] = {}
 
+        # (session_id, chat_type) → chain_id 粘性链，防止 tools 变化导致的雪崩
+        self._sticky: dict[str, dict[str, str]] = {}
+
         # Single-writer queue for SQLite (prevents "database is locked")
         self._write_queue: asyncio.Queue | None = None
         self._writer_task: asyncio.Task | None = None
@@ -243,11 +246,13 @@ class MemoryStore:
 
     def set_canonical(self, session_id: str, sys: str = "", tools: str = "") -> None:
         rec = self._sessions.get(session_id)
-        if rec:
-            if sys:
-                rec.canonical_sys = sys
-            if tools:
-                rec.canonical_tools = tools
+        if not rec:
+            rec = SessionRecord(session_id=session_id)
+            self._sessions[session_id] = rec
+        if sys:
+            rec.canonical_sys = sys
+        if tools:
+            rec.canonical_tools = tools
 
     # ── Prefix chains ────────────────────────────────────────────
 
@@ -286,6 +291,16 @@ class MemoryStore:
 
         clist = self._chains.get(session_id, {}).get(family_key, [])
         return [self._record_to_chain(c) for c in clist]
+
+    # ── Sticky chain ─────────────────────────────────────────
+
+    def get_sticky_chain(self, session_id: str, chat_type: str) -> str | None:
+        """返回 (session_id, chat_type) 的粘性链 ID。无则返回 None。"""
+        return self._sticky.get(session_id, {}).get(chat_type)
+
+    def set_sticky_chain(self, session_id: str, chat_type: str, chain_id: str):
+        """设置 (session_id, chat_type) 的粘性链 ID。"""
+        self._sticky.setdefault(session_id, {})[chat_type] = chain_id
 
     def get_chain_hashes(self, chain_id: str) -> HashIndex | None:
         """Return lazily-built hash index for a chain.

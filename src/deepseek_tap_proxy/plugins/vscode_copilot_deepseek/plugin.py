@@ -19,8 +19,9 @@ class VSCodeCopilotDeepSeekPlugin:
 
     def build_stages(self, ctx: Context) -> list[Stage]:
         stages: list[Stage] = [
+            # ContextNormStage 已移除 — 对命中率无改善，见 context_norm.py 注释
             SysToolsLockStage(),
-            PrefixLockStage(),
+            PrefixLockStage(cross_family_fallback=True),
             CompactionLockStage(),
         ]
         if ctx.chat_type == "compaction":

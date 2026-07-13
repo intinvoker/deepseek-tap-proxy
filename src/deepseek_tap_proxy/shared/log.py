@@ -295,7 +295,7 @@ class LogView:
             "body": {"stringValue": f"request {c.req_id} completed (status={c.status or 0})"},
             "attributes": attrs,
         }
-        return json.dumps(record, ensure_ascii=False)
+        return orjson.dumps(record).decode()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -396,7 +396,7 @@ class TraceWriter:
             record["run_id"] = self.run_id
             offset = self._file.tell()
             self._file.write(
-                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                orjson.dumps(record).decode() + "\n"
             )
             self._file.flush()
             self.count += 1
@@ -563,7 +563,7 @@ class OtlpLogWriter:
                 day_dir = self._run_dir / today
                 day_dir.mkdir(parents=True, exist_ok=True)
                 self._file = open(day_dir / "otlp.jsonl", "a", encoding="utf-8")
-            self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._file.write(orjson.dumps(record).decode() + "\n")
             self._file.flush()
 
     def _close_file(self):

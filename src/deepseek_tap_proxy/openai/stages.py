@@ -42,7 +42,7 @@ def _read_messages_from_jsonl(jsonl_path: str, target_req_id: str, jsonl_offset:
             f.seek(jsonl_offset)
             line = f.readline()
             try:
-                rec = json.loads(line.decode("utf-8"))
+                rec = orjson.loads(line)
                 return rec.get("request", {}).get("body", {}).get("messages", [])
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass  # fall through to reverse scan
@@ -67,7 +67,7 @@ def _read_messages_from_jsonl(jsonl_path: str, target_req_id: str, jsonl_offset:
                 if not line:
                     continue
                 try:
-                    rec = json.loads(line)
+                    rec = orjson.loads(line)
                     if rec.get("request_id") == target_req_id:
                         return rec.get("request", {}).get("body", {}).get("messages", [])
                 except json.JSONDecodeError:

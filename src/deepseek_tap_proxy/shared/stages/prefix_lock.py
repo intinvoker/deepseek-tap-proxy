@@ -24,6 +24,71 @@ from deepseek_tap_proxy.shared.chain import find_anchor_moment
 log = logging.getLogger("deepseek-tap")
 
 
+def _classify_pref_fail(
+    chains: list[Chain],
+    stable_hashes: list[str],
+    family_key: str,
+    store: MemoryStore | None,
+) -> str:
+    """分类 pref=0 的原因，返回简短标签。
+
+    逻辑：
+      1. 无链 → 'init'
+      2. 有链但 family_key 不匹配任何链 → 'tools_changed'
+      3. 有同族链但 position 0 hash 不匹配 → 'context_shift'
+      4. 有同族链、position 0 匹配但整体不匹配 → 'multi_conv'
+      5. 其他 → 'chain_mismatch'
+    """
+    if not chains:
+        return "init"
+
+    if not stable_hashes:
+        return "empty_stable"
+
+    # 检查是否有同 family_key 的链
+    same_family = []
+    other_family = []
+    for c in chains:
+        fk = _chain_family_key(c)
+        if fk == family_key:
+            same_family.append(c)
+        else:
+            other_family.append(c)
+    if not same_family:
+        # 没有同族链 → tools 变更导致 family_key 变化
+        # 进一步检查：其他族链的 position 0 是否匹配
+        first_hash = stable_hashes[0]
+        for c in other_family:
+            ch = (c.messages_hashes or "").split(",")
+            if ch and ch[0] == first_hash:
+                return "tools_changed"  # tools 变但 context 相同
+        return "tools_changed_context_shift"  # tools 变且 context 也变
+
+    # 检查 position 0 hash 是否匹配任何同族链
+    first_hash = stable_hashes[0]
+    for c in same_family:
+        ch = (c.messages_hashes or "").split(",")
+        if ch and ch[0] == first_hash:
+            # position 0 匹配但整体不匹配 → 多 conversation
+            return "multi_conv"
+
+    # 所有同族链的 position 0 都不匹配 → context 日期变化
+    return "context_shift"
+
+
+def _chain_family_key(chain: Chain) -> str:
+    """计算链的 family_key（与 Context._recompute_family_key 一致）。"""
+    import xxhash
+    h = xxhash.xxh3_64()
+    for s in (chain.sys_hashes or "").split(","):
+        if s:
+            h.update(s.encode())
+    for t in (chain.tools_hashes or "").split(","):
+        if t:
+            h.update(t.encode())
+    return h.hexdigest()[:16]
+
+
 def _find_ref_chain(sys_result, tools_result, chains: list[Chain]) -> Chain | None:
     """从 sys/tools 匹配结果中找到参考链（用于 frozen chain 创建）。"""
     for result in (tools_result, sys_result):
@@ -41,8 +106,9 @@ class PrefixLockStage(Stage):
     via store.enqueue_sqlite_write.
     """
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, cross_family_fallback: bool = False) -> None:
         self.enabled = enabled
+        self.cross_family_fallback = cross_family_fallback
 
     async def process(self, ctx: Context) -> Context:
         if not self.enabled:
@@ -73,6 +139,17 @@ class PrefixLockStage(Stage):
 
         # ── CREATE：无已有链 ──
         if not chains:
+            if self.cross_family_fallback:
+                chains = store.get_session_chains(session_id)
+                sticky_id = store.get_sticky_chain(session_id, ctx.chat_type)
+                if sticky_id and chains:
+                    chains.sort(key=lambda c: 0 if c.chain_id == sticky_id else 1)
+
+        if not chains:
+            ctx.meta["pref_fail_reason"] = "init"
+            ctx.meta["matched_chain_id"] = ""
+            ctx.meta["chain_action_type"] = "create"
+            ctx.meta["new_char_count"] = ctx.char_count_of(all_msgs_c)
             create_chain(ctx, all_msgs_c, hit_count=0)
             return ctx
 
@@ -112,6 +189,13 @@ class PrefixLockStage(Stage):
 
         if msg_result is None:
             ctx.meta["pref_msgs_hit"] = 0
+            # ── 分类 pref=0 原因 ──
+            ctx.meta["pref_fail_reason"] = _classify_pref_fail(
+                chains, stable_hashes, ctx.family_key, store
+            )
+            ctx.meta["matched_chain_id"] = ""
+            ctx.meta["chain_action_type"] = "create"
+            ctx.meta["new_char_count"] = ctx.char_count_of(all_msgs_c)
             # ── 跨链锚点：fork 后 tools 匹配但 messages 不匹配 ──
             _ref = _find_ref_chain(sys_result, tools_result, chains)
             if _ref is not None and store:
@@ -129,6 +213,9 @@ class PrefixLockStage(Stage):
         best_chain_id = msg_result.chain_id
         best_chain: Chain = next(c for c in chains if c.chain_id == best_chain_id)
         ctx.persist.prefix_chain_id = best_chain.chain_id
+        # 更新粘性链
+        if self.cross_family_fallback:
+            store.set_sticky_chain(session_id, ctx.chat_type, best_chain_id)
         ctx.meta["prefix_chain_msg_count"] = len(best_chain.sys) + len(best_chain.tools) + len(best_chain.messages)
 
         sys_best = find_chain_result(sys_result, best_chain_id)
@@ -291,6 +378,9 @@ class PrefixLockStage(Stage):
         ctx.persist.chain_id = ctx.chain_action.chain_id
         ctx.persist.chain_action = ctx.chain_action.action
         ctx.persist.chain_msg_count = ctx.chain_action.msg_count
+        ctx.meta["matched_chain_id"] = best_chain.chain_id
+        ctx.meta["chain_action_type"] = ctx.chain_action.action
+        ctx.meta["new_char_count"] = ctx.new_char_count
         if ctx.chain_action.action == "update":
             ctx.persist.chain_tokens = chain_tokens or 0
         return ctx

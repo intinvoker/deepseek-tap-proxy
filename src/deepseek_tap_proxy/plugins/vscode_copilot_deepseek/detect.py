@@ -57,6 +57,9 @@ def _detect_chat_type_deepseek(msgs: list[dict]) -> str:
     m0 = msgs[0].get("content", "")
     if isinstance(m0, str) and m0.startswith(COMPACTION_SIGNATURE):
         return "compaction"
-    if isinstance(m0, str) and "<agents>" in m0:
-        return "normal"
+    if isinstance(m0, str):
+        if "<agents>" in m0:
+            return "normal"
+        else:
+            return "subagent"
     return "normal"
