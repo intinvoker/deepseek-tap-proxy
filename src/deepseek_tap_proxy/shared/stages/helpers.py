@@ -97,7 +97,7 @@ def create_chain(ctx, all_msgs_c: list[dict], hit_count: int) -> ChainAction:
     return ctx.chain_action
 
 
-def persist_chain_nowait(ctx, _db=None) -> None:
+async def persist_chain_nowait(ctx, _db=None) -> None:
     """Pipeline 结束后立即写入 MemoryStore + 异步落 SQLite。
 
     由 openai / anthropic handler 统一调用。替代之前各 handler 的重复实现。
@@ -140,9 +140,10 @@ def persist_chain_nowait(ctx, _db=None) -> None:
         def _write(conn, sid, cid, s, t, m, sh, th, mh, mc, sb, frz):
             upsert_prefix_chain(conn, sid, cid, sys=s, tools=t, messages=m,
                                sys_hashes=sh, tools_hashes=th, messages_hashes=mh,
-                               msg_count=mc, safe_breakpoints=sb, is_frozen=frz)
+                               msg_count=mc, safe_breakpoints=sb, is_frozen=frz,
+                               commit=False)
 
-        store.enqueue_sqlite_write(
+        await store.enqueue_sqlite_write(
             _write, session_id, ca.chain_id,
             sys_json, tools_json, msgs_json,
             sys_hashes, tools_hashes, msgs_hashes,
@@ -160,7 +161,7 @@ def persist_chain_nowait(ctx, _db=None) -> None:
     ))
 
 
-def create_chain_moment(ctx, store) -> None:
+async def create_chain_moment(ctx, store) -> None:
     """Create a ChainMoment after pipeline completes and persist it.
 
     Determines op from chat_type (compaction) or chain_action, then
@@ -211,12 +212,12 @@ def create_chain_moment(ctx, store) -> None:
     # For normal requests, persist_chain_nowait already created the chain.
     # For compaction requests, persist_chain_nowait is skipped (chat_type != "compaction"
     # guard), so we create the chain here.
-    _ensure_chain_exists(ctx, store, chain_id)
+    await _ensure_chain_exists(ctx, store, chain_id)
 
-    store.add_moment(chain_id, moment)
+    await store.add_moment(chain_id, moment)
 
 
-def _ensure_chain_exists(ctx, store, chain_id: str) -> None:
+async def _ensure_chain_exists(ctx, store, chain_id: str) -> None:
     """Ensure a chain record exists in the store, creating it if needed.
 
     Handles both in-memory (0 I/O) and SQLite durability.
@@ -256,9 +257,10 @@ def _ensure_chain_exists(ctx, store, chain_id: str) -> None:
     def _write(conn, sid, cid, s, t, m, sh, th, mh, mc):
         upsert_prefix_chain(conn, sid, cid, sys=s, tools=t, messages=m,
                            sys_hashes=sh, tools_hashes=th, messages_hashes=mh,
-                           msg_count=mc)
+                           msg_count=mc,
+                           commit=False)
 
-    store.enqueue_sqlite_write(
+    await store.enqueue_sqlite_write(
         _write, ctx.session_id or "", chain_id,
         sys_json, tools_json, msgs_json,
         sys_hashes, tools_hashes, msgs_hashes,

@@ -101,7 +101,8 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
                         safe_breakpoints: list[int] | None = None,
                         total_input_tokens: int = 0,
                         is_frozen: bool = False,
-                        moments: str = "[]") -> None:
+                        moments: str = "[]",
+                        commit: bool = True) -> None:
     """Insert or update a prefix chain. Only updates if msg_count is longer.
 
     ``sys``, ``tools``, ``messages`` are JSON strings — canonical form triples.
@@ -110,6 +111,8 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
     used for estimating KV cache hit rates on subsequent requests.
     ``is_frozen`` marks a public prefix chain — never updated once created.
     ``moments`` is a JSON array of Moment dicts.
+
+    ``commit=False`` 时调用方负责 commit/rollback（用于批量事务，writer 统一提交）。
     """
     now = datetime.now(timezone.utc).isoformat()
     safe_breakpoints_json = orjson.dumps(safe_breakpoints).decode() if safe_breakpoints is not None else None
@@ -147,7 +150,8 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
           msg_count, sys_hashes, msg_count, tools_hashes, msg_count, messages_hashes,
           msg_count, msg_count, msg_count, safe_breakpoints_json,
           msg_count, total_input_tokens, now))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # ── Sessions table ──
@@ -195,8 +199,12 @@ def get_session_canonical(conn: sqlite3.Connection,
 
 
 def set_session_canonical(conn: sqlite3.Connection, session_id: str,
-                          sys: str = "", tools: str = "") -> None:
-    """Set canonical sys/tools for a session (UPDATE only non-empty values)."""
+                          sys: str = "", tools: str = "",
+                          *, commit: bool = True) -> None:
+    """Set canonical sys/tools for a session (UPDATE only non-empty values).
+
+    ``commit=False`` 时调用方负责 commit/rollback（用于批量事务，writer 统一提交）。
+    """
     sets = []
     params = []
     if sys:
@@ -212,7 +220,8 @@ def set_session_canonical(conn: sqlite3.Connection, session_id: str,
         f"UPDATE sessions SET {', '.join(sets)} WHERE session_id = ?",
         params,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # ── Prefix chains table ──
@@ -395,10 +404,12 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
 
 
 def insert_request_phase1(conn: sqlite3.Connection, ctx, *,
-                          jsonl_offset: int = 0) -> None:
+                          jsonl_offset: int = 0, commit: bool = True) -> None:
     """Unified Phase 1 INSERT: request-side data, ``record_state='pending'``.
 
     Reads from ``ctx.persist`` (synced by RequestAnalysisStage and CanonicalStage).
+
+    ``commit=False`` 时调用方负责 commit/rollback（用于批量事务，writer 统一提交）。
     """
     model = ctx.body_readonly.get("model", "") if ctx.body_readonly else ""
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -431,7 +442,8 @@ def insert_request_phase1(conn: sqlite3.Connection, ctx, *,
         ctx.persist.trace_category,
         ctx.persist.chat_type or "normal",
     ))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # ── 快照标识：区分「未提供快照」和「快照值为 None」──
@@ -442,7 +454,8 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
                           jsonl_path: str = '',
                           lock_type_snapshot: str | None | object = _SENTINEL_NO_SNAPSHOT,
                           is_modified_snapshot: bool = False,
-                          mod_note_snapshot: str = "") -> None:
+                          mod_note_snapshot: str = "",
+                          commit: bool = True) -> None:
     """Unified Phase 2 UPDATE: fill response data, ``record_state='completed'``.
 
     Reads response data from ``ctx.persist`` (populated by
@@ -452,6 +465,8 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
     ``lock_type_snapshot`` / ``is_modified_snapshot`` / ``mod_note_snapshot``
     override ``ctx.persist`` values — callers should pass the values captured
     immediately after pipeline execution to avoid async closure races.
+
+    ``commit=False`` 时调用方负责 commit/rollback（用于批量事务，writer 统一提交）。
     """
     prompt_tokens = ctx.persist.total_input_tokens
     completion_tokens = ctx.persist.output_tokens
@@ -504,7 +519,8 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
         ctx.persist.sys_tools_locked or None,
         ctx.req_id,
     ))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # ── Query functions (operate on the unified requests table) ─────────

@@ -376,9 +376,17 @@ class TraceView:
 
 
 class TraceWriter:
-    """Writes full trace records to runs/{run_id}/{date}/traces.jsonl."""
+    """Buffered, daily-rotated JSONL for raw trace archive.
 
-    def __init__(self, run_dir: str, run_id: str):
+    Write accumulates records in a buffer; flush happens when
+    ``batch_max`` records accumulate OR ``flush_interval`` elapses OR
+    ``close()`` is called.  Single-file size capped at ``file_max_bytes``
+    (rotates to ``traces-{seq}.jsonl`` within the same day).
+    """
+
+    def __init__(self, run_dir: str, run_id: str,
+                 flush_interval: float = 2.0, batch_max: int = 500,
+                 file_max_bytes: int = 500 * 1024 * 1024) -> None:
         self.run_id = run_id
         self.run_dir = Path(run_dir)
         self._lock = asyncio.Lock()
@@ -391,7 +399,27 @@ class TraceWriter:
         self.models_used: dict[str, int] = {}
         self._current_date = ""
         self._file = None
+        self._file_seq = 1
         self.path = Path(run_dir) / "traces.jsonl"  # 向后兼容引用
+        self._flush_interval = flush_interval
+        self._batch_max = batch_max
+        self._file_max_bytes = file_max_bytes
+        self._pending_count = 0
+        self._last_flush = time.monotonic()
+        self._flusher_task: asyncio.Task | None = None
+
+    def _open_file(self, today: str) -> None:
+        day_dir = self.run_dir / today
+        day_dir.mkdir(parents=True, exist_ok=True)
+        name = "traces.jsonl" if self._file_seq == 1 else f"traces-{self._file_seq}.jsonl"
+        self._file = open(day_dir / name, "a", encoding="utf-8")
+        self.path = day_dir / name
+
+    def _flush_locked(self) -> None:
+        if self._file is not None and not self._file.closed:
+            self._file.flush()
+        self._pending_count = 0
+        self._last_flush = time.monotonic()
 
     async def write(self, record: dict) -> int:
         today = dt.now(timezone.utc).strftime("%Y-%m-%d")
@@ -399,18 +427,22 @@ class TraceWriter:
             if today != self._current_date:
                 self._close_file()
                 self._current_date = today
-                day_dir = self.run_dir / today
-                day_dir.mkdir(parents=True, exist_ok=True)
-                self._file = open(day_dir / "traces.jsonl", "a", encoding="utf-8")
-                self.path = day_dir / "traces.jsonl"
+                self._file_seq = 1
+                self._open_file(today)
+            # 500MB 单文件大小轮转
+            if self._file is not None and self._file.tell() >= self._file_max_bytes:
+                self._close_file()
+                self._file_seq += 1
+                self._open_file(today)
             record["run_id"] = self.run_id
             offset = self._file.tell()
-            self._file.write(
-                orjson.dumps(_coerce_keys(record)).decode() + "\n"
-            )
-            self._file.flush()
+            self._file.write(orjson.dumps(_coerce_keys(record)).decode() + "\n")
+            self._pending_count += 1
             self.count += 1
             self._update_stats(record)
+            if (self._pending_count >= self._batch_max
+                    or time.monotonic() - self._last_flush >= self._flush_interval):
+                self._flush_locked()
             return offset
 
     def _close_file(self) -> None:
@@ -419,8 +451,35 @@ class TraceWriter:
             self._file.close()
             self._file = None
 
-    async def close(self) -> None:
+    async def flush(self) -> None:
         async with self._lock:
+            self._flush_locked()
+
+    async def start_flusher(self) -> None:
+        if self._flusher_task is not None:
+            return
+        self._flusher_task = asyncio.create_task(self._flusher_loop())
+
+    async def _flusher_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._flush_interval)
+                async with self._lock:
+                    if self._pending_count > 0:
+                        self._flush_locked()
+        except asyncio.CancelledError:
+            pass
+
+    async def close(self) -> None:
+        if self._flusher_task is not None:
+            self._flusher_task.cancel()
+            try:
+                await self._flusher_task
+            except asyncio.CancelledError:
+                pass
+            self._flusher_task = None
+        async with self._lock:
+            self._flush_locked()
             self._close_file()
 
     def _update_stats(self, record: dict) -> None:
@@ -494,6 +553,7 @@ def _build_otlp_record(ctx, run_id: str) -> dict:
     model = getattr(ctx, "resp_model", None) or getattr(ctx, "req_model", None) or "?"
     _str_attr("model", model)
     _str_attr("session_id", ctx.session_id or "")
+    _str_attr("kind", "request")
 
     # ── Topic-specific attributes ──
     topic = getattr(ctx, "topic", None) or ""
@@ -519,27 +579,66 @@ def _build_otlp_record(ctx, run_id: str) -> dict:
 
 
 def _chat_otlp_attrs(ctx) -> list[dict]:
-    """chat topic 的 OTLP 专属字段——当前 _build_otlp_record 中全部非基础字段。"""
+    """chat topic 的 OTLP 专属字段 —— OTLP 是持久化超集（除原始 body/headers）。
+
+    字段对齐 PersistRecord（见 2026-07-31-proxy-persist-field-lineage-design.md §5）。
+    """
     c = ctx
     p = ctx.persist
     ca = getattr(c, "chain_action", None)
 
-    attrs = [
-        {"key": "client_type", "value": {"stringValue": c.client_type or ""}},
-        {"key": "chat_type", "value": {"stringValue": c.chat_type or ""}},
-        {"key": "session_method", "value": {"stringValue": c.session_method or ""}},
-        {"key": "upstream_name", "value": {"stringValue": c.meta.get("upstream_name", "default")}},
-        {"key": "lock_type", "value": {"stringValue": p.lock_type or ""}},
-        {"key": "sys_tools_locked", "value": {"stringValue": c.meta.get("sys_tools_locked", "")}},
-        {"key": "cache_hit_tokens", "value": {"intValue": p.cache_hit_tokens or 0}},
-        {"key": "cache_miss_tokens", "value": {"intValue": p.cache_miss_tokens or 0}},
-        {"key": "pref_hit_count", "value": {"intValue": c.meta.get("pref_hit_count", 0)}},
-    ]
+    attrs = []
 
+    def s(k, v):
+        attrs.append({"key": k, "value": {"stringValue": str(v)}})
+
+    def i(k, v):
+        attrs.append({"key": k, "value": {"intValue": int(v)}})
+
+    def f(k, v):
+        attrs.append({"key": k, "value": {"doubleValue": float(v)}})
+
+    # 分类/会话
+    s("client_type", c.client_type or "")
+    s("chat_type", c.chat_type or "")
+    s("session_method", c.session_method or "")
+    s("upstream_name", c.meta.get("upstream_name", "default"))
+    s("session_id", c.session_id or "")
+    s("trace_category", getattr(p, "trace_category", "") or "")
+    s("session_uuid", c.meta.get("session_uuid", "") or "")
+    # 请求
+    i("stream_mode", 1 if getattr(c, "is_streaming", False) else 0)
+    i("prompt_messages_count", p.prompt_messages_count or 0)
+    i("prompt_tools_count", p.prompt_tools_count or 0)
+    s("msg_hash_chain", getattr(p, "msg_hash_chain", "") or c.meta.get("msg_hash_chain", ""))
+    # 锁/链
+    s("lock_type", p.lock_type or "")
+    s("sys_tools_locked", c.meta.get("sys_tools_locked", ""))
+    s("prefix_chain_id", getattr(p, "prefix_chain_id", "") or "")
+    # usage
+    i("total_input_tokens", p.total_input_tokens or 0)
+    i("output_tokens", p.output_tokens or 0)
+    i("total_tokens", (p.total_input_tokens or 0) + (p.output_tokens or 0))
+    i("cache_hit_tokens", p.cache_hit_tokens or 0)
+    i("cache_miss_tokens", p.cache_miss_tokens or 0)
+    i("cache_creation_tokens", p.cache_creation_tokens or 0)
+    f("cache_hit_ratio", p.cache_hit_ratio or 0.0)
+    i("has_reasoning", 1 if p.has_reasoning else 0)
+    i("has_tool_calls", 1 if p.has_tool_calls else 0)
+    # 修改留痕
+    i("is_modified", 1 if p.is_modified else 0)
+    s("modification_note", getattr(p, "modification_note", "") or "")
+    i("system_role_converted", 1 if p.system_role_converted else 0)
+    # 前缀命中
+    i("pref_hit_count", c.meta.get("pref_hit_count", 0))
+    i("pref_sys_hit", c.meta.get("pref_sys_hit", 0))
+    i("pref_tools_hit", c.meta.get("pref_tools_hit", 0))
+    i("pref_msgs_hit", c.meta.get("pref_msgs_hit", c.meta.get("pref_hit_count", 0)))
+    # 链
     if ca and ca.action:
-        attrs.append({"key": "chain_action", "value": {"stringValue": ca.action}})
+        s("chain_action", ca.action)
         if ca.chain_id:
-            attrs.append({"key": "chain_id", "value": {"stringValue": ca.chain_id[:16]}})
+            s("chain_id", ca.chain_id[:16])
 
     return attrs
 

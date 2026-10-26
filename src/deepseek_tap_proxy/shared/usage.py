@@ -74,7 +74,6 @@ def normalize_openai(usage: dict) -> dict:
             normalized["cache_read_input_tokens"] = nested
 
     # ── 3. Defaults ──
-    normalized.setdefault("cache_creation_input_tokens", 0)
     normalized.setdefault("cache_read_input_tokens", 0)
 
     # ── 4. Miss: flat key priority, else compute ──
@@ -86,7 +85,10 @@ def normalize_openai(usage: dict) -> dict:
         cache_read = normalized.get("cache_read_input_tokens", 0) or 0
         normalized["cache_miss_input_tokens"] = max(0, raw_input - cache_read)
 
-    # ── 5. total_input_tokens ──
+    # ── 5. Creation: upstream 优先，miss 回退（DeepSeek 字段名差异）──
+    normalized.setdefault("cache_creation_input_tokens", normalized.get("cache_miss_input_tokens", 0))
+
+    # ── 6. total_input_tokens ──
     input_t = normalized.get("input_tokens", 0) or 0
     normalized["total_input_tokens"] = input_t
 
@@ -124,7 +126,6 @@ def normalize_anthropic(usage: dict) -> dict:
         if cached is not None:
             normalized["cache_read_input_tokens"] = cached
 
-    normalized.setdefault("cache_creation_input_tokens", 0)
     normalized.setdefault("cache_read_input_tokens", 0)
 
     # miss: 优先用 prompt_cache_miss_tokens，否则 input_tokens - cache_read
@@ -135,6 +136,9 @@ def normalize_anthropic(usage: dict) -> dict:
         raw_input = normalized.get("input_tokens", 0) or 0
         cache_read = normalized.get("cache_read_input_tokens", 0) or 0
         normalized["cache_miss_input_tokens"] = max(0, raw_input - cache_read)
+
+    # creation（同 normalize_openai）
+    normalized.setdefault("cache_creation_input_tokens", normalized.get("cache_miss_input_tokens", 0))
 
     # 总输入 = input_tokens（标准 Anthropic 格式的 input_tokens 就是总输入）
     raw_input = normalized.get("input_tokens", 0) or 0

@@ -170,17 +170,17 @@ async def anthropic_proxy_handler(request: web.Request) -> web.StreamResponse:
     writer = proxy_ctx.get("writer")
 
     if db:
-        persist_chain_nowait(ctx, db)
+        await persist_chain_nowait(ctx, db)
     if store:
         ctx.persist.api_format = "anthropic"
         ctx.persist.msg_hash_chain = ctx.msg_hash_chain
         ctx.persist.model = (ctx.body_readonly or {}).get("model", "")
         ctx.persist.stream_mode = ctx.is_streaming
-    store_phase1(ctx, store)
+    await store_phase1(ctx, store)
 
     # ── Handler Moment creation (after pipeline, before run_consumers) ──
     if store and ctx.body_readonly is not None:
-        create_chain_moment(ctx, store)
+        await create_chain_moment(ctx, store)
 
     # ── 5. Phase 2 落盘（管道后，JSONL + DB + log）──
     await run_consumers(

@@ -65,7 +65,7 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
     _snapshot_mod_note = ctx.persist.modification_note
 
     if db:
-        persist_chain_nowait(ctx, db)
+        await persist_chain_nowait(ctx, db)
 
     # ── 请求元数据持久化：统一走 MemoryStore 单写者队列 ──
     store = rt.store if rt else None
@@ -74,10 +74,10 @@ async def chat_completions_handler(request: web.Request) -> web.StreamResponse:
         ctx.persist.msg_hash_chain = ctx.msg_hash_chain
 
         # Phase 1: fire-and-forget insert (state='pending')
-        store.enqueue_request_phase1(ctx)
+        await store.enqueue_request_phase1(ctx)
 
         # ── Handler Moment creation (after pipeline, before run_consumers) ──
-        create_chain_moment(ctx, store)
+        await create_chain_moment(ctx, store)
 
         await run_consumers(
             ctx,

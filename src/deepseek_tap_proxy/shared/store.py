@@ -18,9 +18,14 @@ import orjson
 import sqlite3
 import time as _time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import xxhash
+
+from deepseek_tap_proxy.shared.memory_governance import (
+    estimate_bytes, evict_stale_sessions, evict_lru, truncate_moments,
+    EvictionStats,
+)
 
 log = logging.getLogger("deepseek-tap")
 
@@ -110,7 +115,14 @@ class MemoryStore:
     SQLite is updated asynchronously for durability.
     """
 
-    def __init__(self, db=None) -> None:
+    def __init__(self, db=None,
+                 ttl_hours: int = 168,
+                 max_memory_bytes: int = 200 * 1024 * 1024,
+                 max_moments: int = 100,
+                 enable_governance: bool = True,
+                 db_commit_interval: float = 1.0,
+                 db_batch_max: int = 500,
+                 db_queue_max: int = 1000) -> None:
         self._db = db  # SQLite Database instance for fire-and-forget writes
         self._lock = asyncio.Lock()
 
@@ -136,10 +148,69 @@ class MemoryStore:
         self._write_failures_by_op: dict[str, int] = {}
         # 异常类型 → 失败次数（按错误类型聚合）
         self._write_failures_by_error: dict[str, int] = {}
+        # 批量 commit 次数（批量事务路径）
+        self._batches_committed: int = 0
+
+        # 注入点 + 冷却期
+        self._now = lambda: datetime.now(timezone.utc)
+        self._last_eviction_check: float = 0.0
+        self._eviction_check_interval: int = 300  # 5 minutes
+
+        # 配置
+        self.enable_governance = enable_governance
+        self.ttl_hours = ttl_hours
+        self.max_memory_bytes = max_memory_bytes
+        self.max_moments = max_moments
+
+        # 批量写者配置
+        self._db_commit_interval = db_commit_interval
+        self._db_batch_max = db_batch_max
+        self._db_queue_max = db_queue_max
+
+        # 统计（累积）
+        self._stale_evictions_total: int = 0
+        self._lru_evictions_total: int = 0
+        self._moments_truncated_total: int = 0
+        self._lazy_reload_count: int = 0
 
         if db is not None:
-            self._write_queue = asyncio.Queue()
+            self._write_queue = asyncio.Queue(maxsize=db_queue_max)
             self._start_writer()
+
+    def maybe_maintain(self) -> EvictionStats:
+        """每次请求入口调用。TTL 淘汰 → LRU 淘汰。返回统计信息。
+
+        TTL 淘汰有 5 分钟冷却期。
+        LRU 检查每次执行。
+
+        当 enable_governance=False 时立即返回空统计（Inspector 回放用）。
+        """
+        if not self.enable_governance:
+            return EvictionStats()
+
+        now = self._now()
+        stale_evicted = 0
+
+        # L2: TTL（冷却期保护）
+        if now.timestamp() - self._last_eviction_check >= self._eviction_check_interval:
+            stale_evicted = evict_stale_sessions(
+                self._sessions, self._chains,
+                now=now, ttl_hours=self.ttl_hours,
+            )
+            self._stale_evictions_total += stale_evicted
+            self._last_eviction_check = now.timestamp()
+
+        # L3: LRU
+        lru_evicted = evict_lru(
+            self._sessions, self._chains,
+            max_memory=self.max_memory_bytes,
+        )
+        self._lru_evictions_total += lru_evicted
+
+        return EvictionStats(
+            stale_evicted=stale_evicted,
+            lru_evicted=lru_evicted,
+        )
 
     def _get_conn(self):
         """Get SQLite connection for async writes."""
@@ -170,11 +241,11 @@ class MemoryStore:
             for s in candidates[:50]
         ]
 
-    def upsert_session(self, session_id: str, client_type: str,
-                       anchor_msg_index: int = 0,
-                       curr_hashes: list[str] | None = None,
-                       now: str = "",
-                       _schedule_persist: bool = True) -> SessionRecord:
+    async def upsert_session(self, session_id: str, client_type: str,
+                             anchor_msg_index: int = 0,
+                             curr_hashes: list[str] | None = None,
+                             now: str = "",
+                             _schedule_persist: bool = True) -> SessionRecord:
         """Get existing or create new session. Always updates last_seen/time.
 
         When ``_schedule_persist`` is True (default), a fire-and-forget SQLite
@@ -203,13 +274,13 @@ class MemoryStore:
             self._sessions[session_id] = rec
             # Fire-and-forget session to SQLite
             if _schedule_persist:
-                self._enqueue_session_persist(session_id, client_type, anchor_msg_index,
-                                              hash_str, len(curr_hashes) if curr_hashes else 0, now)
+                await self._enqueue_session_persist(session_id, client_type, anchor_msg_index,
+                                                    hash_str, len(curr_hashes) if curr_hashes else 0, now)
             return rec
 
-    def _enqueue_session_persist(self, session_id: str, client_type: str,
-                                  anchor_msg_index: int, hash_str: str,
-                                  hash_len: int, now: str) -> None:
+    async def _enqueue_session_persist(self, session_id: str, client_type: str,
+                                        anchor_msg_index: int, hash_str: str,
+                                        hash_len: int, now: str) -> None:
         """Fire-and-forget: persist session to SQLite."""
         from deepseek_tap_proxy.shared.db import get_or_create_session_by_explicit_id
 
@@ -224,11 +295,11 @@ class MemoryStore:
                 conn.execute(
                     "INSERT INTO sessions (session_id, client_type, anchor_msg_index, max_hash_chain, hash_chain_length, start_time, last_seen_time, total_requests) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                     (sid, ct, ami, hs, hl, t, t))
-            conn.commit()
+            # 不 commit — 由 writer 线程批量统一 commit
 
-        self.enqueue_sqlite_write(_write, session_id, client_type, anchor_msg_index,
-                                  hash_str, hash_len, now,
-                                  op_name="session_persist")
+        await self.enqueue_sqlite_write(_write, session_id, client_type, anchor_msg_index,
+                                        hash_str, hash_len, now,
+                                        op_name="session_persist")
 
     def update_session_hash_chain(self, session_id: str, curr_hashes: list[str]) -> None:
         existing = self._sessions.get(session_id)
@@ -286,11 +357,24 @@ class MemoryStore:
         return chains
 
     def get_family_chains(self, session_id: str, family_key: str) -> list:
-        """Get prefix chains for a specific branch family as ``Chain`` objects."""
+        """Get prefix chains for a specific branch family.
+
+        If memory miss, lazy reload from SQLite.
+        """
         from deepseek_tap_proxy.shared.chain import Chain, ChainMoment
 
         clist = self._chains.get(session_id, {}).get(family_key, [])
-        return [self._record_to_chain(c) for c in clist]
+        if clist:
+            return [self._record_to_chain(c) for c in clist]
+
+        # L4: Lazy reload from SQLite
+        if self._db is not None:
+            records = self._lazy_load_chains(session_id, family_key)
+            if records:
+                self._lazy_reload_count += 1
+                return [self._record_to_chain(r) for r in records]
+
+        return []
 
     # ── Sticky chain ─────────────────────────────────────────
 
@@ -354,6 +438,53 @@ class MemoryStore:
             tools_hashes=rec.tools_hashes,
             messages_hashes=rec.messages_hashes,
         )
+
+    def _lazy_load_chains(self, session_id: str, family_key: str) -> list["ChainRecord"]:
+        """从 SQLite 按需加载 chains 并恢复到内存。
+
+        仅当 session 已在内存中时才回载（启动窗口守卫）。
+        """
+        # 守卫：session 不在内存中 → 不在启动窗口内 → 拒绝回载
+        if session_id not in self._sessions:
+            return []
+
+        conn = self._get_conn()
+        if conn is None:
+            return []
+
+        try:
+            from deepseek_tap_proxy.shared.db import get_session_chains as db_get_chains
+            rows = db_get_chains(conn, session_id)
+        except Exception as exc:
+            log.warning("MemoryStore lazy reload failed for session %s (fk=%s): %s",
+                        session_id, family_key, exc)
+            return []
+
+        records: list["ChainRecord"] = []
+        for d in rows:
+            rec = ChainRecord(
+                chain_id=d.get("chain_id", ""),
+                session_id=d.get("session_id", ""),
+                sys=d.get("sys", "[]"),
+                tools=d.get("tools", "[]"),
+                messages=d.get("messages", "[]"),
+                sys_hashes=d.get("sys_hashes", ""),
+                tools_hashes=d.get("tools_hashes", ""),
+                messages_hashes=d.get("messages_hashes", ""),
+                msg_count=d.get("msg_count", 0),
+                safe_breakpoints=d.get("safe_breakpoints"),
+                total_input_tokens=d.get("total_input_tokens", 0),
+                is_frozen=bool(d.get("is_frozen", 0)),
+                created_at=d.get("created_at", ""),
+                last_seen=d.get("last_seen", ""),
+                moments=d.get("moments", "[]"),
+            )
+            fk = self.compute_family_key(rec.sys_hashes, rec.tools_hashes)
+            if fk == family_key:
+                self._chains.setdefault(session_id, {}).setdefault(fk, []).append(rec)
+                records.append(rec)
+
+        return records
 
     def upsert_chain(self, session_id: str, chain_id: str, *,
                      sys: str = "[]", tools: str = "[]", messages: str = "[]",
@@ -424,7 +555,7 @@ class MemoryStore:
                         return c
         return None
 
-    def add_moment(self, chain_id: str, moment: 'ChainMoment') -> None:
+    async def add_moment(self, chain_id: str, moment: 'ChainMoment') -> None:
         """Append a ChainMoment to an existing chain.
 
         Updates in-memory record (0 I/O) and queues a fire-and-forget
@@ -453,20 +584,23 @@ class MemoryStore:
                             "timestamp": moment.timestamp,
                         })
                         c.moments = orjson.dumps(moments).decode()
-                        # Queue SQLite write
-                        self._enqueue_moment_persist(chain_id, moments)
+                        # L5: 截断内存中的 moments（DB 永久留痕，SQLite 写入完整列表）
+                        n = truncate_moments(c, max_moments=self.max_moments)
+                        self._moments_truncated_total += n
+                        # 传入完整 moments 列表（截断前），DB 保留完整历史
+                        await self._enqueue_moment_persist(chain_id, moments)
                         return
 
-    def _enqueue_moment_persist(self, chain_id: str, moments: list[dict]) -> None:
+    async def _enqueue_moment_persist(self, chain_id: str, moments: list[dict]) -> None:
         """Fire-and-forget: update the moments JSON column in SQLite."""
         def _write(conn, cid, m_json):
             conn.execute(
                 "UPDATE prefix_chains SET moments = ? WHERE chain_id = ?",
                 (orjson.dumps(m_json).decode(), cid),
             )
-            conn.commit()
+            # 不 commit — 由 writer 线程批量统一 commit
 
-        self.enqueue_sqlite_write(_write, chain_id, moments, op_name="chain_moment")
+        await self.enqueue_sqlite_write(_write, chain_id, moments, op_name="chain_moment")
 
     # ── Persist queue ────────────────────────────────────────────
 
@@ -487,84 +621,116 @@ class MemoryStore:
         if db is None:
             return
         import queue as _sync_queue
-        _q = _sync_queue.Queue()
+        _q = _sync_queue.Queue(maxsize=self._db_queue_max)
         _done = asyncio.Event()
 
         def _thread_worker():
-            conn = db.conn  # thread-local: creates connection in THIS thread
+            conn = db.conn  # thread-local
             _consecutive_failures = 0
-            _MAX_CONSECUTIVE_FAILURES = 20  # ~5 min at 17s/item, recycle connection
+            _MAX_CONSECUTIVE_FAILURES = 20
+
+            def _unpack(item):
+                if len(item) == 3:
+                    return item[0], item[1], item[2]
+                return item[0], item[1], ""
+
+            def _record_failure(op_name, exc):
+                nonlocal _consecutive_failures
+                _consecutive_failures += 1
+                self._write_failures += 1
+                ts = datetime.now(timezone.utc).isoformat()
+                self._last_write_failure = ts
+                reason = type(exc).__qualname__
+                self._write_failures_by_error[reason] = \
+                    self._write_failures_by_error.get(reason, 0) + 1
+                if op_name:
+                    self._write_failures_by_op[op_name] = \
+                        self._write_failures_by_op.get(op_name, 0) + 1
+                log.error(
+                    "MemoryStore: SQLite write failed after %d attempt(s): %s | "
+                    "op=%s queue_depth=%d successes=%d failures=%d consecutive=%d",
+                    _MAX_RETRIES + 1, exc, op_name or "?",
+                    _q.qsize(), self._write_successes, self._write_failures,
+                    _consecutive_failures,
+                )
+
+            def _replay_one_by_one(batch):
+                """整批失败 → 逐条重放（每条独立 commit），坏条目不拖垮整批。"""
+                for item in batch:
+                    sync_fn, args, op_name = _unpack(item)
+                    last_exc = None
+                    for attempt in range(_MAX_RETRIES + 1):
+                        try:
+                            sync_fn(conn, *args)
+                            conn.commit()
+                            self._write_successes += 1
+                            self._last_write_success = datetime.now(timezone.utc).isoformat()
+                            last_exc = None
+                            _consecutive_failures = 0
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            if attempt < _MAX_RETRIES:
+                                _time.sleep(_RETRY_DELAYS[attempt])
+                    if last_exc:
+                        _record_failure(op_name, last_exc)
+
+            def _run_batch(batch):
+                """执行整批（各 sync_fn 不 commit）→ 单 commit；失败 rollback + 逐条重放。"""
+                try:
+                    for item in batch:
+                        sync_fn, args, op_name = _unpack(item)
+                        sync_fn(conn, *args)
+                    conn.commit()
+                    self._write_successes += len(batch)
+                    self._last_write_success = datetime.now(timezone.utc).isoformat()
+                    _consecutive_failures = 0
+                    self._batches_committed += 1
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    _replay_one_by_one(batch)
 
             while True:
-                item = _q.get()
-                if item is None:  # sentinel
+                # 收集一批：先等第一条（超时=无任务，空闲继续）；低流量单条立即落盘
+                try:
+                    item = _q.get(timeout=self._db_commit_interval)
+                except _sync_queue.Empty:
+                    continue
+                if item is None:  # shutdown sentinel
+                    break
+                batch = [item]
+                stopping = False
+                while len(batch) < self._db_batch_max:
+                    try:
+                        nxt = _q.get_nowait()
+                    except _sync_queue.Empty:
+                        break
+                    if nxt is None:
+                        stopping = True
+                        break
+                    batch.append(nxt)
+                _run_batch(batch)
+                if stopping:
                     break
 
-                # item = (sync_fn, args) or (sync_fn, args, op_name)
-                if len(item) == 3:
-                    sync_fn, args, op_name = item
-                else:
-                    sync_fn, args = item
-                    op_name = ""
-
-                last_exc: Exception | None = None
-                _rollback_ok = True
-                for attempt in range(_MAX_RETRIES + 1):
+                # 连接退化回收（保留原逻辑）
+                if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    log.warning(
+                        "MemoryStore: writer connection degraded (%d consecutive failures), recycling...",
+                        _consecutive_failures)
                     try:
-                        sync_fn(conn, *args)
-                        # success
-                        self._write_successes += 1
-                        self._last_write_success = datetime.now(timezone.utc).isoformat()
-                        last_exc = None
-                        _consecutive_failures = 0
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        # 根因修复：commit() 失败后事务仍活跃，必须 rollback
-                        try:
-                            conn.rollback()
-                            _rollback_ok = True
-                        except Exception:
-                            _rollback_ok = False
-                        if attempt < _MAX_RETRIES:
-                            _time.sleep(_RETRY_DELAYS[attempt])
-                        # last attempt: falls through to error logging
-
-                if last_exc:
-                    _consecutive_failures += 1
-                    self._write_failures += 1
-                    ts = datetime.now(timezone.utc).isoformat()
-                    self._last_write_failure = ts
-                    reason = type(last_exc).__qualname__
-                    self._write_failures_by_error[reason] = \
-                        self._write_failures_by_error.get(reason, 0) + 1
-                    if op_name:
-                        self._write_failures_by_op[op_name] = \
-                            self._write_failures_by_op.get(op_name, 0) + 1
-                    log.error(
-                        "MemoryStore: SQLite write failed after %d attempt(s): %s | "
-                        "op=%s queue_depth=%d successes=%d failures=%d "
-                        "consecutive=%d rollback_ok=%s",
-                        _MAX_RETRIES + 1, last_exc,
-                        op_name or "?", _q.qsize(),
-                        self._write_successes, self._write_failures,
-                        _consecutive_failures, _rollback_ok,
-                    )
-
-                    # 连接退化：连续失败超过阈值 → 关闭旧连接创建新连接
-                    if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                        log.warning(
-                            "MemoryStore: writer connection degraded (%d consecutive failures), "
-                            "recycling connection...",
-                            _consecutive_failures,
-                        )
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        conn = db.conn  # fresh connection, new file handle
-                        _consecutive_failures = 0
-                        log.info("MemoryStore: writer connection recycled successfully")
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = db.conn
+                    _consecutive_failures = 0
 
             _q.task_done()
 
@@ -577,51 +743,51 @@ class MemoryStore:
                 item = await self._write_queue.get()
                 if item is None:  # sentinel
                     break
-                _q.put(item)
+                # 有界同步队列满时阻塞（to_thread 中执行，不卡事件循环），
+                # 停止消费 async 队列 → 背压传导回 enqueue_sqlite_write 侧。
+                await asyncio.to_thread(_q.put, item)
         finally:
             _q.put(None)  # stop thread worker
             t.join(timeout=5)
 
-    def enqueue_sqlite_write(self, sync_fn, *args, op_name: str = "") -> None:
+    async def enqueue_sqlite_write(self, sync_fn, *args, op_name: str = "") -> None:
         """Fire-and-forget: queue a SQLite write for the background writer.
 
-        The sync_fn receives the SQLite connection as first argument.
-        MemoryStore is already updated (0 I/O) — this is durability only.
-
-        ``op_name`` is a human-readable label for observability (stats / health).
+        Bounded queue with async backpressure — blocks (awaits) when the
+        queue is full so no write is dropped under extreme load.
         """
         if self._write_queue is None:
             return
-        self._write_queue.put_nowait((sync_fn, args, op_name))
+        await self._write_queue.put((sync_fn, args, op_name))
 
     async def flush(self) -> None:
-        """Drain all pending SQLite writes without stopping the writer.
+        """Drain pending SQLite writes without stopping the writer.
 
-        Puts a sentinel in the queue and polls until all items enqueued
-        before this call have been processed by the writer thread.
-        Call before opening a new SQLite connection to read committed
-        data in tests (WAL snapshot isolation).
+        Best-effort: waits for the async queue to drain and gives the
+        writer thread one commit interval to flush a trailing partial
+        batch.  Call before opening a new SQLite connection to read
+        committed data in tests (WAL snapshot isolation).
         """
         if self._write_queue is None:
             return
-        # Drain the async queue first (short poll)
-        for _ in range(100):
+        for _ in range(1000):
             if self._write_queue.empty():
                 break
             await asyncio.sleep(0.001)
-        # Give the sync queue + writer thread time to commit
-        await asyncio.sleep(0.05)
+        # 给 writer 一个 commit_interval 让尾批（不足 batch_max）落盘
+        await asyncio.sleep(self._db_commit_interval + 0.05)
 
     async def flush_pending(self) -> None:
         """Await all pending SQLite writes + stop writer (called during shutdown)."""
         if self._write_queue is None:
             return
-        # Drain queue
-        while not self._write_queue.empty():
+        for _ in range(1000):
+            if self._write_queue.empty():
+                break
             await asyncio.sleep(0.01)
-        # Stop writer
+        await asyncio.sleep(self._db_commit_interval + 0.05)
         if self._writer_task:
-            self._write_queue.put_nowait(None)  # sentinel
+            await self._write_queue.put(None)  # sentinel
             try:
                 await asyncio.wait_for(self._writer_task, timeout=10)
             except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -657,14 +823,48 @@ class MemoryStore:
             "failures_by_op": dict(self._write_failures_by_op),
             "failures_by_error": dict(self._write_failures_by_error),
             "queue_depth": queue_depth,
+            "batches_committed": self._batches_committed,
+            "queue_max": self._db_queue_max,
+        }
+
+    def get_memory_stats(self) -> dict:
+        """返回内存治理统计（供 /health 消费）。"""
+        est = estimate_bytes(self._sessions, self._chains)
+        chain_count = sum(len(clist) for fmap in self._chains.values() for clist in fmap.values())
+        return {
+            "estimated_bytes": est,
+            "max_bytes": self.max_memory_bytes,
+            "usage_pct": round(est / max(self.max_memory_bytes, 1) * 100, 1),
+            "sessions": len(self._sessions),
+            "chains": chain_count,
+            "stale_evictions_total": self._stale_evictions_total,
+            "lru_evictions_total": self._lru_evictions_total,
+            "moments_truncated_total": self._moments_truncated_total,
+            "lazy_reload_count": self._lazy_reload_count,
+            "last_eviction_check": datetime.fromtimestamp(
+                self._last_eviction_check, tz=timezone.utc
+            ).isoformat() if self._last_eviction_check else "",
         }
 
     # ── Lifecycle ───────────────────────────────────────────────
 
     @classmethod
-    async def load_from(cls, db, _db=None) -> MemoryStore:
-        """Populate MemoryStore from existing SQLite data at startup."""
-        store = cls(db=_db or db)
+    async def load_from(cls, db, _db=None, load_window_hours: int = 168,
+                        enable_governance: bool = True,
+                        db_commit_interval: float = 1.0,
+                        db_batch_max: int = 500,
+                        db_queue_max: int = 1000) -> MemoryStore:
+        """Populate MemoryStore from existing SQLite data at startup.
+
+        ``load_window_hours`` — L1 startup window: only load sessions and chains
+        with activity within this window (default 7 days).
+        ``enable_governance`` — enable TTL + LRU eviction (default True, set False for Inspector).
+        """
+        store = cls(db=_db or db, enable_governance=enable_governance,
+                    db_commit_interval=db_commit_interval,
+                    db_batch_max=db_batch_max,
+                    db_queue_max=db_queue_max)
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=load_window_hours)).isoformat()
 
         def _load():
             conn = db.conn if hasattr(db, 'conn') else db
@@ -682,9 +882,12 @@ class MemoryStore:
                 except sqlite3.OperationalError:
                     pass
 
-                # Load sessions
+                # Load sessions — 加时间窗口
                 try:
-                    rows = conn.execute("SELECT * FROM sessions").fetchall()
+                    rows = conn.execute(
+                        "SELECT * FROM sessions WHERE last_seen_time >= ?",
+                        (cutoff,),
+                    ).fetchall()
                     for row in rows:
                         d = dict(row)
                         store._sessions[d["session_id"]] = SessionRecord(
@@ -702,9 +905,12 @@ class MemoryStore:
                 except sqlite3.OperationalError:
                     pass
 
-                # Load prefix chains
+                # Load prefix chains — 加时间窗口
                 try:
-                    rows = conn.execute("SELECT * FROM prefix_chains ORDER BY last_seen DESC").fetchall()
+                    rows = conn.execute(
+                        "SELECT * FROM prefix_chains WHERE last_seen >= ? ORDER BY last_seen DESC",
+                        (cutoff,),
+                    ).fetchall()
                     for row in rows:
                         d = dict(row)
                         rec = ChainRecord(
@@ -752,11 +958,10 @@ class MemoryStore:
     # 哨兵：区分「未提供快照」和「快照值为 None」
     _NO_SNAPSHOT = object()
 
-    def enqueue_request_phase1(self, ctx) -> None:
+    async def enqueue_request_phase1(self, ctx) -> None:
         """Fire-and-forget: insert request record (Phase 1, state='pending')."""
         from deepseek_tap_proxy.shared.db import insert_request_phase1
 
-        # snapshot ctx values for the write lambda
         _api_format = ctx.persist.api_format
         _trace_category = ctx.persist.trace_category
         _msg_hash_chain = ctx.msg_hash_chain
@@ -767,16 +972,16 @@ class MemoryStore:
             if _tc:
                 _ctx.persist.trace_category = _tc
             _ctx.persist.msg_hash_chain = _mhc
-            insert_request_phase1(conn, _ctx)
+            insert_request_phase1(conn, _ctx, commit=False)
 
-        self.enqueue_sqlite_write(_write, ctx, _api_format, _trace_category, _msg_hash_chain,
-                                  op_name="req_phase1")
+        await self.enqueue_sqlite_write(_write, ctx, _api_format, _trace_category, _msg_hash_chain,
+                                        op_name="req_phase1")
 
-    def enqueue_request_phase2(self, ctx, *,
-                                jsonl_path: str = "",
-                                lock_type_snapshot: str | None | object = _NO_SNAPSHOT,
-                                is_modified_snapshot: bool = False,
-                                mod_note_snapshot: str = "") -> None:
+    async def enqueue_request_phase2(self, ctx, *,
+                                     jsonl_path: str = "",
+                                     lock_type_snapshot: str | None | object = _NO_SNAPSHOT,
+                                     is_modified_snapshot: bool = False,
+                                     mod_note_snapshot: str = "") -> None:
         """Fire-and-forget: update request record (Phase 2, record_state='completed').
 
         When ``lock_type_snapshot`` is ``None`` it means "no lock" — distinct
@@ -792,9 +997,10 @@ class MemoryStore:
             _update(conn, _ctx, jsonl_path=_jp,
                     lock_type_snapshot=_lt_inner,
                     is_modified_snapshot=_im,
-                    mod_note_snapshot=_mn)
+                    mod_note_snapshot=_mn,
+                    commit=False)
 
-        self.enqueue_sqlite_write(
+        await self.enqueue_sqlite_write(
             _write, ctx, jsonl_path,
             _lt, is_modified_snapshot, mod_note_snapshot,
             op_name="req_phase2",

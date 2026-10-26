@@ -70,7 +70,7 @@ class SysToolsLockStage(Stage):
                                 sys=cur_sys_json if cur_sys else "",
                                 tools=cur_tools_json if cur_tools else "")
             # Fire-and-forget SQLite
-            _schedule_canonical_init(store, session_id, cur_sys_json, cur_tools_json)
+            await _schedule_canonical_init(store, session_id, cur_sys_json, cur_tools_json)
             ctx.meta["sys_tools_locked"] = "init"
             ctx.persist.sys_tools_locked = "init"
             ctx.sys_tools_snap = SysToolsSnapshot(
@@ -126,13 +126,13 @@ class SysToolsLockStage(Stage):
         return ctx
 
 
-def _schedule_canonical_init(store: MemoryStore, session_id: str,
-                             sys_json: str, tools_json: str) -> None:
+async def _schedule_canonical_init(store: MemoryStore, session_id: str,
+                                   sys_json: str, tools_json: str) -> None:
     """Fire-and-forget: persist canonical to SQLite."""
     from deepseek_tap_proxy.shared.db import set_session_canonical
 
     def _write(conn, sid, s, t):
-        set_session_canonical(conn, sid, sys=s, tools=t)
+        set_session_canonical(conn, sid, sys=s, tools=t, commit=False)
 
-    store.enqueue_sqlite_write(_write, session_id, sys_json, tools_json,
-                               op_name="canonical_init")
+    await store.enqueue_sqlite_write(_write, session_id, sys_json, tools_json,
+                                     op_name="canonical_init")

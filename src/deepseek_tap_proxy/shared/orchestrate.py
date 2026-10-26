@@ -19,6 +19,11 @@ async def orchestrate(ctx, format_pipeline, plugins, format_tail):
     Returns:
         ctx（管道2 执行完毕，ctx.response 就绪）
     """
+    # ── 内存维护（每次请求入口）──
+    rt = ctx.request.get("runtime")
+    if rt and rt.store:
+        rt.store.maybe_maintain()
+
     # ── 管道1：解析 + context[]化 ──
     ctx = await format_pipeline.execute(ctx)
     if ctx.should_abort:

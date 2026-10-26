@@ -21,17 +21,17 @@ async def jsonl_write(ctx, writer, store=None) -> None:
             log.exception(f"[{ctx.req_id}] JSONL write failed")
 
 
-def store_phase1(ctx, store) -> None:
+async def store_phase1(ctx, store) -> None:
     """MemoryStore Phase 1 入队（管道前）。"""
     if store and ctx.body_readonly is not None:
-        store.enqueue_request_phase1(ctx)
+        await store.enqueue_request_phase1(ctx)
 
 
-def store_phase2(ctx, store, writer=None, **kwargs) -> None:
+async def store_phase2(ctx, store, writer=None, **kwargs) -> None:
     """MemoryStore Phase 2 入队（管道后）。"""
     if store and ctx.body_readonly is not None:
         jsonl_path = str(writer.path) if writer else ""
-        store.enqueue_request_phase2(ctx, jsonl_path=jsonl_path, **kwargs)
+        await store.enqueue_request_phase2(ctx, jsonl_path=jsonl_path, **kwargs)
 
 
 def emit_terminal(ctx) -> None:
@@ -50,6 +50,6 @@ async def run_consumers(ctx, *, writer=None, store=None,
                         otlp_writer=None, run_id="", **kwargs) -> None:
     """运行所有 Consumer。Pipeline 后调用。"""
     await jsonl_write(ctx, writer, store)
-    store_phase2(ctx, store, writer, **kwargs)
+    await store_phase2(ctx, store, writer, **kwargs)
     emit_terminal(ctx)
     emit_otlp(ctx, otlp_writer, run_id)

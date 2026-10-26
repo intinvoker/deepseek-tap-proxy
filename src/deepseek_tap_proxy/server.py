@@ -44,7 +44,13 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     app = web.Application(client_max_size=64 * 1024**2)
 
     run_id, run_dir = _create_run_dir(config.trace_dir)
-    writer = TraceWriter(run_dir, run_id)
+    writer = TraceWriter(
+        run_dir, run_id,
+        flush_interval=config.trace_flush_interval,
+        batch_max=config.trace_batch_max,
+        file_max_bytes=config.trace_file_max_bytes,
+    )
+    await writer.start_flusher()  # 启动后台定时 flush（低流量落盘）
     db = Database(config.db_path)
     db.init_db()
     # Close the main-thread connection so the fire-and-forget writer thread
@@ -52,7 +58,13 @@ async def create_proxy_app(config: ProxyConfig, *, add_health: bool = True) -> w
     db.close()
 
     # MemoryStore: load existing data from SQLite into in-memory store (0 I/O runtime)
-    store = await MemoryStore.load_from(db, _db=db)
+    store = await MemoryStore.load_from(
+        db, _db=db,
+        enable_governance=config.enable_governance,
+        db_commit_interval=config.db_commit_interval,
+        db_batch_max=config.db_batch_max,
+        db_queue_max=config.db_queue_max,
+    )
 
     client_session = aiohttp.ClientSession(
         headers={"User-Agent": "DeepSeekTap/0.1"},
@@ -215,6 +227,22 @@ async def _health_handler(request: web.Request) -> web.Response:
             result["status"] = "degraded"
         if stats["writes_attempted"] > 100 and stats["failure_rate"] > 0.05:
             result["status"] = "degraded"
+
+        # 内存统计
+        mem_stats = store.get_memory_stats()
+        result["memory"] = {
+            "estimated_bytes": mem_stats["estimated_bytes"],
+            "max_bytes": mem_stats["max_bytes"],
+            "usage_pct": mem_stats["usage_pct"],
+            "sessions": mem_stats["sessions"],
+            "chains": mem_stats["chains"],
+        }
+        result["eviction"] = {
+            "stale_evictions_total": mem_stats["stale_evictions_total"],
+            "lru_evictions_total": mem_stats["lru_evictions_total"],
+            "moments_truncated_total": mem_stats["moments_truncated_total"],
+            "last_eviction_check": mem_stats["last_eviction_check"],
+        }
     return web.json_response(result)
 
 
