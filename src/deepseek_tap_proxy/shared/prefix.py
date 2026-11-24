@@ -106,7 +106,7 @@ def make_chain_id(hash_chain: list[str]) -> str:
     """从 hash_chain 内容衍生链 ID。
 
     xxhash3_64 保证确定性和低碰撞率。
-    同 hash_chain = 同 chain_id（CREATE 路径下不冲突，详见设计文档）。
+    同 hash_chain = 同 chain_id（CREATE 路径下不冲突）。
     """
     import xxhash
     return xxhash.xxh3_64("|".join(hash_chain).encode()).hexdigest()[:16]

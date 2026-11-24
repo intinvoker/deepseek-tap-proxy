@@ -1,6 +1,6 @@
 """OpenAI-specific database functions.
 
-.. deprecated:: v7 (2026-06-07)
+.. deprecated:: v7
     Replaced by ``shared/db.py`` + ``MemoryStore`` single-writer queue.
     All request persistence now goes through ``store.enqueue_request_phase1/2``.
     This module is kept for reference only — no src code imports it.
@@ -39,7 +39,7 @@ def create_openai_tables(conn: sqlite3.Connection) -> None:
             has_tool_calls INTEGER DEFAULT 0,
             prompt_messages_count INTEGER DEFAULT 0,
             prompt_tools_count INTEGER DEFAULT 0,
-            session_fingerprint TEXT DEFAULT NULL,
+            session_fingerprint TEXT DEFAULT NULL,  -- deprecated: fingerprint-retirement V1
             session_type TEXT DEFAULT NULL,
             jsonl_path TEXT NOT NULL
         );
@@ -199,50 +199,15 @@ def update_modification_flag(conn: sqlite3.Connection, ctx) -> None:
 
 
 def _split_session_key(session: Session) -> tuple[str | None, str | None]:
-    """Split Session into (session_uuid, session_fingerprint) for DB write."""
+    """Split Session into (session_uuid, session_fingerprint) for DB write.
+
+    .. deprecated:: fingerprint-retirement V1
+       session_fingerprint 仅作为历史列保留（写入恒为 session.fingerprint），
+       新查询一律走 session_id/chain_id。
+    """
     key = session.key
     fp = session.fingerprint or key
     if len(key) >= 32 and "-" in key:
         return (key, fp)
     return (None, fp)
 
-
-def get_previous_by_fingerprint(
-    conn, fingerprint: str, exclude_req_id: str,
-) -> tuple[str | None, int] | None:
-    """Get (msg_hash_chain, prompt_messages_count) by session_fingerprint."""
-    row = conn.execute("""
-        SELECT msg_hash_chain, prompt_messages_count FROM requests
-        WHERE session_fingerprint = ? AND request_id != ?
-          AND msg_hash_chain IS NOT NULL
-        ORDER BY id DESC LIMIT 1
-    """, (fingerprint, exclude_req_id)).fetchone()
-    if row and row["msg_hash_chain"]:
-        return (row["msg_hash_chain"], row["prompt_messages_count"])
-    return None
-
-
-def get_previous_msg0_by_fingerprint(
-    conn, fingerprint: str,
-) -> tuple[str, str] | None:
-    """Get (msg0_hash, msg0_content) by session_fingerprint."""
-    row = conn.execute("""
-        SELECT msg0_hash, msg0_content FROM requests
-        WHERE session_fingerprint = ? AND msg0_hash IS NOT NULL
-        ORDER BY timestamp DESC LIMIT 1
-    """, (fingerprint,)).fetchone()
-    if row and row["msg0_hash"]:
-        return (row["msg0_hash"], row["msg0_content"])
-    return None
-
-
-def get_previous_jsonl_by_fingerprint(
-    conn, fingerprint: str, exclude_req_id: str,
-) -> tuple[str, str, int] | None:
-    """Get (jsonl_path, request_id, jsonl_offset) by session_fingerprint."""
-    row = conn.execute("""
-        SELECT jsonl_path, request_id, jsonl_offset FROM requests
-        WHERE session_fingerprint = ? AND request_id != ? AND jsonl_path != ''
-        ORDER BY id DESC LIMIT 1
-    """, (fingerprint, exclude_req_id)).fetchone()
-    return (row["jsonl_path"], row["request_id"], row["jsonl_offset"] or 0) if row else None

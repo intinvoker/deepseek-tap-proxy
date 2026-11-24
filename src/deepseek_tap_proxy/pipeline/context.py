@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import orjson
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +29,41 @@ from deepseek_tap_proxy.pipeline.chain_action import ChainAction
 from deepseek_tap_proxy.pipeline.snapshot import SysToolsSnapshot
 
 REQUEST_ID_LENGTH = 12
+
+# 外部客户端外传的请求级关联 id。合法形态 = 32 位 hex（大小写不敏感，trim 后），
+# 与客户端 RequestId（Guid "N" 格式）同构；proxy 直接复用，实现两端日志按同一键关联。
+EXTERNAL_REQUEST_ID_HEADER = "x-tap-request-id"
+_EXTERNAL_REQUEST_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def external_request_id(request) -> str:
+    """读请求头 ``x-tap-request-id``（客户端外传）→ 统一小写；非法/缺失返回 ""。
+
+    宽松防御：请求对象可能没有 headers（单测用 dict/MagicMock），头值可能非 str——
+    任何异常形态都回退到生成逻辑，绝不因坏头阻断转发。
+
+    与 ``resolve_request_id`` 同为请求 id 解析唯一入口（Context 与 Responses
+    passthrough handler 共用，避免两处形态判定漂移）。
+    """
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return ""
+    try:
+        raw = headers.get(EXTERNAL_REQUEST_ID_HEADER)
+    except (AttributeError, TypeError):
+        return ""
+    if not isinstance(raw, str):
+        return ""
+    raw = raw.strip()
+    if not _EXTERNAL_REQUEST_ID_RE.match(raw):
+        return ""
+    return raw.lower()
+
+
+def resolve_request_id(request) -> str:
+    """请求 id 唯一解析入口：合法外传 id 优先，否则生成 ``req_<uuid12>``。"""
+    return external_request_id(request) or (
+        f"req_{uuid.uuid4().hex[:REQUEST_ID_LENGTH]}")
 
 
 class MessageIndex:
@@ -53,8 +89,10 @@ class MessageIndex:
             self.hits += 1
             return entry[1], entry[2]
         # 新 dict 或 id 碰撞（极罕见）：计算并缓存
+        # hash 前剥离 cache_control（DeepSeek 忽略该字段——对齐 msg_hash 语义）
         self.misses += 1
-        raw = orjson.dumps(msg)
+        from deepseek_tap_proxy.shared.hash import _strip_cache_control
+        raw = orjson.dumps(_strip_cache_control(msg))
         h = xxhash.xxh3_64(raw).hexdigest()[:16]
         cc = len(raw)
         self._idx[mid] = (msg, h, cc)
@@ -68,6 +106,8 @@ class Context:
     request: web.Request
     body_readonly: dict | None = None   # 只读：ParseStage 设置后永不修改
     fwd_body: dict | None = None
+    raw_body: bytes = b""               # 客户端原始请求字节（passthrough 字节级转发用）
+    fwd_raw_bytes: bytes | None = None  # 非 None 时 Transport 直接用它作为转发 body
     fwd_headers: dict = field(default_factory=dict)
     req_id: str = ""
     format: str = ""                    # "openai" | "anthropic"
@@ -78,9 +118,26 @@ class Context:
     timeout: int = 600
 
     status: int = 0
-    resp_body: dict | None = None
+    resp_body_max_bytes: int = 0      # 0=不截断；>0 时 setter 结构内截断 resp_body
+    _resp_body: dict | None = field(default=None, repr=False)
     resp_bytes: bytes = b""
     resp_headers: dict = field(default_factory=dict)
+
+    @property
+    def resp_body(self) -> dict | None:
+        return self._resp_body
+
+    @resp_body.setter
+    def resp_body(self, value: dict | None) -> None:
+        """赋值时按 resp_body_max_bytes 截断（聚合副本，转发流不受影响）。
+
+        大响应体（MB 级）是单请求内存峰值主因——截断使峰值有界。
+        截断语义见 shared.log.truncate_resp_body（viewer 展示层同构）。
+        """
+        if value is not None and self.resp_body_max_bytes > 0:
+            from deepseek_tap_proxy.shared.log import truncate_resp_body
+            value, _ = truncate_resp_body(value, self.resp_body_max_bytes)
+        self._resp_body = value
 
     should_abort: bool = False
     response: web.StreamResponse | None = None
@@ -99,6 +156,17 @@ class Context:
     chat_type: str = ""
     session_id: str = ""
     session_method: str = ""
+
+    # ── 内部身份（由适配器从外部协议转化，禁止外部词汇）──
+    # chain_id 标识「谁在说话」：跨请求稳定，主代理与各子代理各持一个值。
+    #
+    # ⚠️ 与 ctx.persist.chain_id 同名不同义 —— 同一次请求上两者取值不同：
+    #    · 本字段        = 身份，由适配器从外部协议转化而来；
+    #    · persist.chain_id = 前缀链标识，由 sys/tools/messages 哈希派生。
+    #    收敛后两者归到同一概念，但字段仍分处两层，
+    #    跨层传递时必须指明用哪一个 —— 取错会静默查不到链（不报错）。
+    chain_id: str = ""
+    parent_chain_id: str = ""      # 父身份；主代理与一级子代理均为空串
 
     # ── 规范形式分段长度（view setter 自动刷新）──
     orig_sys_len: int = 0
@@ -131,10 +199,14 @@ class Context:
 
     def __post_init__(self) -> None:
         self._t0 = time.monotonic()
-        self.req_id = f"req_{uuid.uuid4().hex[:REQUEST_ID_LENGTH]}"
+        self.req_id = resolve_request_id(self.request)
         if self.fwd_body is None and self.body_readonly is not None:
             # json roundtrip 比 deepcopy 快 ~2.5×（body 是 JSON 原生类型）
             self.fwd_body = orjson.loads(orjson.dumps(self.body_readonly))
+
+    def _external_request_id(self) -> str:
+        """兼容入口：委托模块级 ``external_request_id``（唯一实现）。"""
+        return external_request_id(self.request)
 
     @property
     def elapsed_ms(self) -> int:
@@ -174,7 +246,8 @@ class Context:
                 for item in system:
                     if isinstance(item, dict) and item.get("type") == "text":
                         txt = item.get("text", "")
-                        result.append({"role": "system", "content": txt})
+                        if txt:
+                            result.append({"role": "system", "content": txt})
                 return result
             return []
         return []
@@ -343,14 +416,18 @@ class Context:
 
     @property
     def resp_usage(self) -> dict:
-        if not self.resp_body:
+        if not isinstance(self.resp_body, dict):
             return {}
-        from deepseek_tap_proxy.shared.usage import normalize_usage
-        return normalize_usage(self.resp_body.get("usage", {}), self.format)
+        # Usage 抽象层统一入口：厂商从 upstream_name（路由配置名）探测，
+        # 缺失时按响应特征（billing_usage 等）兜底
+        from deepseek_tap_proxy.shared.usage import REGISTRY, detect_vendor
+        raw = self.resp_body.get("usage", {})
+        vendor = self.meta.get("upstream_name", "") or detect_vendor(raw)
+        return REGISTRY.extract(raw, self.format, vendor)
 
     @property
     def resp_model(self) -> str:
-        if self.resp_body:
+        if isinstance(self.resp_body, dict):
             m = self.resp_body.get("model")
             if m:
                 return m
@@ -363,7 +440,7 @@ class Context:
 
     @property
     def resp_has_tool_calls(self) -> bool:
-        if not self.resp_body:
+        if not isinstance(self.resp_body, dict):
             return False
         if self.format == "openai":
             choices = self.resp_body.get("choices", [])
@@ -377,7 +454,7 @@ class Context:
 
     @property
     def resp_has_reasoning(self) -> bool:
-        if not self.resp_body:
+        if not isinstance(self.resp_body, dict):
             return False
         if self.format == "openai":
             choices = self.resp_body.get("choices", [])

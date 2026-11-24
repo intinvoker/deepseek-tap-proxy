@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+.worktrees
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+tests
+data
+build
+*.db
+*.db-wal
+*.db-shm

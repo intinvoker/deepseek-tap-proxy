@@ -3,7 +3,7 @@
 ForwardStage 不关心响应来源，只调 transport.fetch(ctx)。
 
 运行时: AiohttpTransport(session) → 真实上游 HTTP 调用
-Replay:  TraceTransport(trace_response) → trace JSON (Inspector 侧)
+Replay:  TraceTransport(trace_response) → trace JSON（回放侧）
 """
 from __future__ import annotations
 
@@ -67,7 +67,14 @@ class AiohttpTransport(Transport):
                 upstream_url = target.rstrip("/") + req_path
 
         body_bytes = None
-        if ctx.fwd_body is not None:
+        if getattr(ctx, "fwd_raw_bytes", None) is not None:
+            # passthrough：直接转发客户端原始字节（不重排 JSON）
+            body_bytes = ctx.fwd_raw_bytes
+            if body_bytes or ctx.request.method in ("POST", "PUT", "PATCH", "DELETE"):
+                ctx.fwd_headers["Content-Length"] = str(len(body_bytes))
+            else:
+                ctx.fwd_headers.pop("Content-Length", None)
+        elif ctx.fwd_body is not None:
             body_bytes = orjson.dumps(ctx.fwd_body)
             ctx.fwd_headers["Content-Length"] = str(len(body_bytes))
         else:
@@ -88,7 +95,11 @@ class AiohttpTransport(Transport):
         headers = filter_hop_by_hop(dict(upstream_resp.headers))
 
         # ── 流式: 不读 body，返回 chunk 流让 ForwardStage 边转发边重建 ──
-        if getattr(ctx, 'is_streaming', False) and upstream_resp.status == 200:
+        # passthrough 下未知 API 可能不声明 stream 字段，但响应是 SSE——
+        # 以响应 Content-Type 兜底探测（不改响应字节，只决定转发方式）。
+        _content_type = headers.get("Content-Type", headers.get("content-type", ""))
+        _is_sse = "text/event-stream" in str(_content_type).lower()
+        if (getattr(ctx, 'is_streaming', False) or _is_sse) and upstream_resp.status == 200:
             async def _iter_chunks():
                 async for chunk in upstream_resp.content.iter_any():
                     yield chunk

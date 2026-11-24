@@ -4,7 +4,7 @@ from __future__ import annotations
 from deepseek_tap_proxy.pipeline import Stage, Context
 from deepseek_tap_proxy.plugins.base import DetectionResult
 from deepseek_tap_proxy.plugins.hermes.detect import detect_hermes
-from deepseek_tap_proxy.shared.stages import SysToolsLockStage, PrefixLockStage
+from deepseek_tap_proxy.plugins.hermes.stages.partition_lock import HermesPartitionLockStage
 
 
 class HermesPlugin:
@@ -15,4 +15,5 @@ class HermesPlugin:
         return detect_hermes(ctx)
 
     def build_stages(self, ctx: Context) -> list[Stage]:
-        return []  # Hermes 不需要 Lock stage
+        # 分段锁：sys 只锁稳定段，易变段放行；tools 整体锁。
+        return [HermesPartitionLockStage()]

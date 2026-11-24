@@ -10,9 +10,13 @@ log = logging.getLogger("deepseek-tap")
 
 
 async def jsonl_write(ctx, writer, store=None) -> None:
-    """JSONL 落盘（管道后）。"""
+    """JSONL 落盘（管道后）。
+
+    不要求 body_readonly 非空——rejected/blocked 请求（body 解析失败）
+    也写 minimal 留痕（topic=rejected），保证全请求可追溯。
+    """
     from deepseek_tap_proxy.shared.log import TraceView
-    if writer and store and ctx.body_readonly is not None:
+    if writer and store:
         try:
             record = TraceView(ctx).as_dict()
             jsonl_offset = await writer.write(record)

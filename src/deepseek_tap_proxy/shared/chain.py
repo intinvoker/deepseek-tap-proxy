@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ChainMoment:
-    """一次 API 请求的快照。对应 TUI ChainMoment。"""
+    """一次 API 请求的快照。"""
     messages_count: int
     op: str                       # "create" | "update" | "compact"
     total_tokens: int = 0         # 上游 input_tokens（真实值）
@@ -16,7 +16,7 @@ class ChainMoment:
 
 @dataclass
 class Chain:
-    """前缀链实体。对应 TUI Chain。"""
+    """前缀链实体。"""
     chain_id: str
     session_id: str
     sys: list[dict]

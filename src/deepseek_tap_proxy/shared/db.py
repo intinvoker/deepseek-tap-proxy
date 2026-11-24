@@ -11,9 +11,29 @@ and properties, never from raw format-specific structures.
 from __future__ import annotations
 
 import json
+import logging
 import orjson
 import sqlite3
+
+log = logging.getLogger("deepseek-tap")
 from datetime import datetime, timezone
+
+from deepseek_tap_proxy.shared.dbdialect import SqliteDialect
+
+
+def _dialect_of(conn):
+    """Return the dialect attached to ``conn`` (``_tap_db``), else a SqliteDialect."""
+    dialect = getattr(conn, "_tap_db", None)
+    if dialect is not None:
+        return dialect
+    return SqliteDialect()
+
+
+def _exec(conn, sql, params):
+    """Execute ``sql`` (with %(name)s named placeholders) via the conn's dialect."""
+    dialect = _dialect_of(conn)
+    bound_sql, names = dialect.bind(sql)
+    return conn.execute(bound_sql, dialect.translate_params(params, names))
 
 
 # ── Sessions table helpers ──
@@ -21,7 +41,8 @@ from datetime import datetime, timezone
 
 def get_session_by_id(conn: sqlite3.Connection, session_id: str) -> dict | None:
     """Get session by ID. Returns dict or None."""
-    row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+    row = _exec(conn, "SELECT * FROM sessions WHERE session_id = %(session_id)s",
+                {"session_id": session_id}).fetchone()
     return dict(row) if row else None
 
 
@@ -39,30 +60,35 @@ def get_or_create_session_by_explicit_id(
 
     existing = get_session_by_id(conn, session_id)
     if existing:
-        conn.execute("""
+        _exec(conn, """
             UPDATE sessions SET
-                last_seen_time = ?,
+                last_seen_time = %(now)s,
                 total_requests = total_requests + 1
-            WHERE session_id = ?
-        """, (now, session_id))
+            WHERE session_id = %(session_id)s
+        """, {"now": now, "session_id": session_id})
         if len(curr_hashes) > existing["hash_chain_length"]:
             hash_chain_str = ",".join(curr_hashes)
-            conn.execute("""
-                UPDATE sessions SET max_hash_chain = ?, hash_chain_length = ?
-                WHERE session_id = ?
-            """, (hash_chain_str, len(curr_hashes), session_id))
+            _exec(conn, """
+                UPDATE sessions SET max_hash_chain = %(hash_chain_str)s, hash_chain_length = %(len)s
+                WHERE session_id = %(session_id)s
+            """, {"hash_chain_str": hash_chain_str, "len": len(curr_hashes),
+                  "session_id": session_id})
         conn.commit()
-        return dict(conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone())
+        return dict(_exec(conn, "SELECT * FROM sessions WHERE session_id = %(session_id)s",
+                          {"session_id": session_id}).fetchone())
     else:
         hash_chain_str = ",".join(curr_hashes)
-        conn.execute("""
+        _exec(conn, """
             INSERT INTO sessions (session_id, client_type, anchor_msg_index,
                 max_hash_chain, hash_chain_length, start_time, last_seen_time, total_requests)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-        """, (session_id, client_type, anchor_msg_index,
-              hash_chain_str, len(curr_hashes), now, now))
+            VALUES (%(session_id)s, %(client_type)s, %(anchor_msg_index)s,
+                    %(hash_chain_str)s, %(len)s, %(now)s, %(now)s, 1)
+        """, {"session_id": session_id, "client_type": client_type,
+              "anchor_msg_index": anchor_msg_index, "hash_chain_str": hash_chain_str,
+              "len": len(curr_hashes), "now": now})
         conn.commit()
-        return dict(conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone())
+        return dict(_exec(conn, "SELECT * FROM sessions WHERE session_id = %(session_id)s",
+                          {"session_id": session_id}).fetchone())
 
 
 def update_session_hash_chain(
@@ -74,20 +100,21 @@ def update_session_hash_chain(
     existing = get_session_by_id(conn, session_id)
     if existing and len(curr_hashes) > existing["hash_chain_length"]:
         hash_chain_str = ",".join(curr_hashes)
-        conn.execute("""
-            UPDATE sessions SET max_hash_chain = ?, hash_chain_length = ?
-            WHERE session_id = ?
-        """, (hash_chain_str, len(curr_hashes), session_id))
+        _exec(conn, """
+            UPDATE sessions SET max_hash_chain = %(hash_chain_str)s, hash_chain_length = %(len)s
+            WHERE session_id = %(session_id)s
+        """, {"hash_chain_str": hash_chain_str, "len": len(curr_hashes),
+              "session_id": session_id})
         conn.commit()
 
 
 def find_candidate_sessions(conn: sqlite3.Connection, client_type: str) -> list[dict]:
     """Find active sessions matching client_type, ordered by last_seen desc."""
-    rows = conn.execute("""
+    rows = _exec(conn, """
         SELECT * FROM sessions
-        WHERE client_type = ? AND hash_chain_length > 0
+        WHERE client_type = %(client_type)s AND hash_chain_length > 0
         ORDER BY last_seen_time DESC LIMIT 50
-    """, (client_type,)).fetchall()
+    """, {"client_type": client_type}).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -115,41 +142,47 @@ def upsert_prefix_chain(conn: sqlite3.Connection, session_id: str, chain_id: str
     ``commit=False`` 时调用方负责 commit/rollback（用于批量事务，writer 统一提交）。
     """
     now = datetime.now(timezone.utc).isoformat()
+    # PG is_frozen 列是 INTEGER；Python bool → psycopg 适配为 boolean → DatatypeMismatch
+    # （SQLite 隐式 0/1 从未暴露）。显式归一。
+    is_frozen = int(is_frozen)
     safe_breakpoints_json = orjson.dumps(safe_breakpoints).decode() if safe_breakpoints is not None else None
-    conn.execute("""
+    # ON CONFLICT(...) DO UPDATE：SQLite 3.24+ 与 PostgreSQL 均支持的 UPSERT 语法
+    # 命名占位符可重复出现（_exec 按 names 顺序逐次取值，双方言一致）
+    _exec(conn, """
         INSERT INTO prefix_chains
             (session_id, chain_id, sys, tools, messages,
              sys_hashes, tools_hashes, messages_hashes,
              msg_count,
              safe_breakpoints, total_input_tokens, is_frozen, created_at, last_seen, moments)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%(session_id)s, %(chain_id)s, %(sys)s, %(tools)s, %(messages)s,
+                %(sys_hashes)s, %(tools_hashes)s, %(messages_hashes)s,
+                %(msg_count)s,
+                %(safe_breakpoints_json)s, %(total_input_tokens)s, %(is_frozen)s, %(now)s, %(now)s, %(moments)s)
         ON CONFLICT(chain_id) DO UPDATE SET
-            sys = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                       THEN ? ELSE prefix_chains.sys END,
-            tools = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                         THEN ? ELSE prefix_chains.tools END,
-            messages = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                            THEN ? ELSE prefix_chains.messages END,
-            sys_hashes = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                              THEN ? ELSE prefix_chains.sys_hashes END,
-            tools_hashes = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                                THEN ? ELSE prefix_chains.tools_hashes END,
-            messages_hashes = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                                   THEN ? ELSE prefix_chains.messages_hashes END,
-            msg_count = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                             THEN ? ELSE prefix_chains.msg_count END,
-            safe_breakpoints = CASE WHEN ? > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
-                                   THEN ? ELSE prefix_chains.safe_breakpoints END,
-            total_input_tokens = CASE WHEN ? > prefix_chains.msg_count THEN ? ELSE prefix_chains.total_input_tokens END,
-            last_seen = ?
-    """, (session_id, chain_id, sys, tools, messages,
-          sys_hashes, tools_hashes, messages_hashes,
-          msg_count,
-          safe_breakpoints_json, total_input_tokens, is_frozen, now, now, moments,
-          msg_count, sys, msg_count, tools, msg_count, messages,
-          msg_count, sys_hashes, msg_count, tools_hashes, msg_count, messages_hashes,
-          msg_count, msg_count, msg_count, safe_breakpoints_json,
-          msg_count, total_input_tokens, now))
+            sys = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                       THEN %(sys)s ELSE prefix_chains.sys END,
+            tools = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                         THEN %(tools)s ELSE prefix_chains.tools END,
+            messages = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                            THEN %(messages)s ELSE prefix_chains.messages END,
+            sys_hashes = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                              THEN %(sys_hashes)s ELSE prefix_chains.sys_hashes END,
+            tools_hashes = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                                THEN %(tools_hashes)s ELSE prefix_chains.tools_hashes END,
+            messages_hashes = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                                   THEN %(messages_hashes)s ELSE prefix_chains.messages_hashes END,
+            msg_count = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                             THEN %(msg_count)s ELSE prefix_chains.msg_count END,
+            safe_breakpoints = CASE WHEN %(msg_count)s > prefix_chains.msg_count AND prefix_chains.is_frozen = 0
+                                    THEN %(safe_breakpoints_json)s ELSE prefix_chains.safe_breakpoints END,
+            total_input_tokens = CASE WHEN %(msg_count)s > prefix_chains.msg_count THEN %(total_input_tokens)s ELSE prefix_chains.total_input_tokens END,
+            last_seen = %(now)s
+    """, {"session_id": session_id, "chain_id": chain_id, "sys": sys, "tools": tools,
+          "messages": messages, "sys_hashes": sys_hashes, "tools_hashes": tools_hashes,
+          "messages_hashes": messages_hashes, "msg_count": msg_count,
+          "safe_breakpoints_json": safe_breakpoints_json,
+          "total_input_tokens": total_input_tokens, "is_frozen": is_frozen,
+          "now": now, "moments": moments})
     if commit:
         conn.commit()
 
@@ -189,12 +222,12 @@ def create_sessions_table(conn: sqlite3.Connection) -> None:
 def get_session_canonical(conn: sqlite3.Connection,
                           session_id: str) -> dict[str, str]:
     """Get canonical sys/tools for a session."""
-    row = conn.execute(
-        "SELECT canonical_sys, canonical_tools FROM sessions WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()
+    row = _exec(conn,
+                "SELECT canonical_sys, canonical_tools FROM sessions WHERE session_id = %(session_id)s",
+                {"session_id": session_id}).fetchone()
     if row:
-        return {"sys": row[0] or "", "tools": row[1] or ""}
+        # PG dict_row vs SQLite Row：统一键访问（整数索引仅 SQLite 支持）
+        return {"sys": row["canonical_sys"] or "", "tools": row["canonical_tools"] or ""}
     return {"sys": "", "tools": ""}
 
 
@@ -206,22 +239,108 @@ def set_session_canonical(conn: sqlite3.Connection, session_id: str,
     ``commit=False`` 时调用方负责 commit/rollback（用于批量事务，writer 统一提交）。
     """
     sets = []
-    params = []
+    params = {}
     if sys:
-        sets.append("canonical_sys = ?")
-        params.append(sys)
+        sets.append("canonical_sys = %(sys)s")
+        params["sys"] = sys
     if tools:
-        sets.append("canonical_tools = ?")
-        params.append(tools)
+        sets.append("canonical_tools = %(tools)s")
+        params["tools"] = tools
     if not sets:
         return
-    params.append(session_id)
-    conn.execute(
-        f"UPDATE sessions SET {', '.join(sets)} WHERE session_id = ?",
+    params["session_id"] = session_id
+    cur = _exec(
+        conn,
+        f"UPDATE sessions SET {', '.join(sets)} WHERE session_id = %(session_id)s",
         params,
     )
+    # 显式化：session 行不存在 → UPDATE 0 行静默失败。sessions 表已废弃
+    # （upsert_session 无调用点，6/24 后不落库），canonical 落盘长期失效——
+    # 打 warning 暴露，避免再次潜伏数周。
+    if cur.rowcount == 0:
+        log.warning(
+            "set_session_canonical: session %r not in sessions table, "
+            "UPDATE affected 0 rows (upsert_session 无调用点 → sessions 表未维护)",
+            session_id,
+        )
     if commit:
         conn.commit()
+
+
+# ── Chain canonical table（canonical 持久化真源）──
+#
+# canonical 按 (session_id, chain_id) 隔离：Claude Code 子代理复用主会话
+# session-id，session 级单份存储会让子代理冻结面被主代理整体覆写。
+# chain_id 一律存**归一后**的值（主代理 = session_id，见 MemoryStore._canonical_key），
+# 读回时直接构成内存 key。本层保持「存什么读什么」——库中若残留空 chain_id 的
+# 历史行（漏归一的旧写入方），由装载侧 MemoryStore._normalize_loaded_canonicals
+# 容错归一，规则不在两层各存一份。
+
+
+def create_chain_canonical_table(conn: sqlite3.Connection) -> None:
+    """Create the chain_canonical table (canonical 的落盘真源)。"""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS chain_canonical (
+            session_id  TEXT NOT NULL,
+            chain_id    TEXT NOT NULL,
+            sys         TEXT NOT NULL DEFAULT '',
+            tools       TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (session_id, chain_id)
+        );
+    """)
+    conn.commit()
+
+
+def get_chain_canonical(conn: sqlite3.Connection, session_id: str,
+                        chain_id: str) -> dict[str, str]:
+    """Get canonical sys/tools for one (session_id, chain_id). 缺失返回两个空串。"""
+    row = _exec(conn,
+                "SELECT sys, tools FROM chain_canonical "
+                "WHERE session_id = %(session_id)s AND chain_id = %(chain_id)s",
+                {"session_id": session_id, "chain_id": chain_id}).fetchone()
+    if row:
+        return {"sys": row["sys"] or "", "tools": row["tools"] or ""}
+    return {"sys": "", "tools": ""}
+
+
+def set_chain_canonical(conn: sqlite3.Connection, session_id: str, chain_id: str,
+                        *, sys: str = "", tools: str = "",
+                        commit: bool = True) -> None:
+    """UPSERT canonical for one (session_id, chain_id) —— 仅覆盖非空值。
+
+    单条 UPSERT 完成读改写（无 read-modify-write 竞态），语义与
+    ``set_session_canonical`` 一致：空入参不覆盖已落库的值。sys/tools 均空
+    时不建行（无实际冻结内容）。
+
+    ``commit=False`` 时调用方负责 commit/rollback（用于批量事务，writer 统一提交）。
+    """
+    if not sys and not tools:
+        return
+    _exec(conn, """
+        INSERT INTO chain_canonical (session_id, chain_id, sys, tools)
+        VALUES (%(session_id)s, %(chain_id)s, %(sys)s, %(tools)s)
+        ON CONFLICT (session_id, chain_id) DO UPDATE SET
+            sys = CASE WHEN %(sys)s != '' THEN %(sys)s ELSE chain_canonical.sys END,
+            tools = CASE WHEN %(tools)s != '' THEN %(tools)s
+                         ELSE chain_canonical.tools END
+    """, {"session_id": session_id, "chain_id": chain_id,
+          "sys": sys, "tools": tools})
+    if commit:
+        conn.commit()
+
+
+def load_all_chain_canonicals(conn: sqlite3.Connection,
+                              ) -> dict[tuple[str, str], tuple[str, str]]:
+    """一次读全部 canonical → {(session_id, chain_id): (sys, tools)}。
+
+    返回形态与 ``MemoryStore._canonicals`` 同形，供冷启动批量装载（避免 N+1）。
+    表不存在（旧库未迁移）时由调用方捕获 ``sqlite3.OperationalError``。
+    """
+    rows = _exec(conn,
+                 "SELECT session_id, chain_id, sys, tools FROM chain_canonical",
+                 None).fetchall()
+    return {(r["session_id"], r["chain_id"]): (r["sys"] or "", r["tools"] or "")
+            for r in rows}
 
 
 # ── Prefix chains table ──
@@ -257,13 +376,13 @@ def create_prefix_chains_table(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE prefix_chains ADD COLUMN {col} {col_type}")
         except sqlite3.OperationalError:
             pass
-    # Migration: three-column hash (2026-06-10)
+    # Migration: three-column hash
     for col in ("sys_hashes", "tools_hashes", "messages_hashes"):
         try:
             conn.execute(f"ALTER TABLE prefix_chains ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
-    # Migration: moments JSON column (2026-06-16)
+    # Migration: moments JSON column
     try:
         conn.execute("ALTER TABLE prefix_chains ADD COLUMN moments TEXT DEFAULT '[]'")
     except sqlite3.OperationalError:
@@ -277,9 +396,9 @@ def get_session_chains(conn: sqlite3.Connection, session_id: str) -> list[dict]:
     Returns rows with canonical three-column format:
     ``sys``, ``tools``, ``messages`` — all JSON strings.
     """
-    rows = conn.execute("""
-        SELECT * FROM prefix_chains WHERE session_id = ? ORDER BY last_seen DESC
-    """, (session_id,)).fetchall()
+    rows = _exec(conn, """
+        SELECT * FROM prefix_chains WHERE session_id = %(session_id)s ORDER BY last_seen DESC
+    """, {"session_id": session_id}).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -356,7 +475,7 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
             prompt_tools_count INTEGER DEFAULT 0,
             session_id            TEXT DEFAULT NULL,
             session_uuid          TEXT DEFAULT NULL,
-            session_fingerprint   TEXT DEFAULT NULL,
+            session_fingerprint   TEXT DEFAULT NULL,  -- deprecated: fingerprint-retirement V1（只读历史列，新查询用 session_id/chain_id）
             session_type          TEXT DEFAULT NULL,
             api_format            TEXT DEFAULT NULL,
             jsonl_path            TEXT NOT NULL DEFAULT '',
@@ -371,6 +490,10 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
             system_role_converted INTEGER DEFAULT 0,
             sys_tools_locked      TEXT DEFAULT NULL,
             chat_type             TEXT DEFAULT 'normal',
+            mode                  TEXT DEFAULT 'managed',
+            kind                  TEXT DEFAULT 'chat',
+            intervention          INTEGER DEFAULT 0,
+            intervention_note     TEXT DEFAULT '',
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE SET NULL,
             FOREIGN KEY (prefix_chain_id) REFERENCES prefix_chains(chain_id) ON DELETE SET NULL
         );
@@ -390,16 +513,29 @@ def create_requests_table(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE requests DROP COLUMN {col}")
         except sqlite3.OperationalError:
             pass
-    # Migration: add chat_type column (2026-06-09)
+    # Migration: add chat_type column
     try:
         conn.execute("ALTER TABLE requests ADD COLUMN chat_type TEXT DEFAULT 'normal'")
     except sqlite3.OperationalError:
         pass
-    # Migration: add sys_tools_locked column (2026-06-12, ADR #17)
+    # Migration: add sys_tools_locked column
     try:
         conn.execute("ALTER TABLE requests ADD COLUMN sys_tools_locked TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass
+    # Migration: passthrough-policy columns
+    # 老库补列（新库已在上方 CREATE TABLE 中带上）；SQLite 不支持 ADD COLUMN IF NOT EXISTS，
+    # 用 OperationalError 兜底（列已存在）。
+    for _col in (
+        "mode TEXT DEFAULT 'managed'",
+        "kind TEXT DEFAULT 'chat'",
+        "intervention INTEGER DEFAULT 0",
+        "intervention_note TEXT DEFAULT ''",
+    ):
+        try:
+            conn.execute(f"ALTER TABLE requests ADD COLUMN {_col}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -414,34 +550,43 @@ def insert_request_phase1(conn: sqlite3.Connection, ctx, *,
     model = ctx.body_readonly.get("model", "") if ctx.body_readonly else ""
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    conn.execute("""
-        INSERT OR IGNORE INTO requests
+    # INSERT OR IGNORE 是 SQLite 专有语法 → 统一用 UPSERT 写法（SQLite 3.24+/PG 均支持）
+    _exec(conn, """
+        INSERT INTO requests
             (request_id, timestamp, duration_ms, status_code, model, stream_mode,
              prompt_messages_count, prompt_tools_count,
              is_modified, modification_note,
              session_id, session_fingerprint, session_type,
              msg_hash_chain,
              jsonl_path, jsonl_offset, record_state,
-             api_format, trace_category, chat_type)
-        VALUES (?, ?, 0, 0, ?, ?, ?, ?, 0, '', ?, ?,
-                ?, ?, ?, ?, 'pending', ?, ?, ?)
-    """, (
-        ctx.req_id,
-        timestamp,
-        model,
-        1 if ctx.is_streaming else 0,
-        ctx.persist.prompt_messages_count,
-        ctx.persist.prompt_tools_count,
-        ctx.persist.session_id or None,
-        "",                                       # session_fingerprint — deprecated
-        ctx.persist.client_type or None,          # session_type → client_type
-        ctx.persist.msg_hash_chain,
-        ctx.meta.get("jsonl_path", ""),
-        jsonl_offset,
-        ctx.persist.api_format,
-        ctx.persist.trace_category,
-        ctx.persist.chat_type or "normal",
-    ))
+             api_format, trace_category, chat_type, mode, kind)
+        VALUES (%(request_id)s, %(timestamp)s, 0, 0, %(model)s, %(stream_mode)s,
+                %(prompt_messages_count)s, %(prompt_tools_count)s,
+                0, '', %(session_id)s, %(session_fingerprint)s, %(session_type)s,
+                %(msg_hash_chain)s,
+                %(jsonl_path)s, %(jsonl_offset)s, 'pending',
+                %(api_format)s, %(trace_category)s, %(chat_type)s,
+                %(mode)s, %(kind)s)
+        ON CONFLICT(request_id) DO NOTHING
+    """, {
+        "request_id": ctx.req_id,
+        "timestamp": timestamp,
+        "model": model,
+        "stream_mode": 1 if ctx.is_streaming else 0,
+        "prompt_messages_count": ctx.persist.prompt_messages_count,
+        "prompt_tools_count": ctx.persist.prompt_tools_count,
+        "session_id": ctx.persist.session_id or None,
+        "session_fingerprint": "",                       # deprecated
+        "session_type": ctx.persist.client_type or None,  # session_type → client_type
+        "msg_hash_chain": ctx.persist.msg_hash_chain,
+        "jsonl_path": ctx.meta.get("jsonl_path", ""),
+        "jsonl_offset": jsonl_offset,
+        "api_format": ctx.persist.api_format,
+        "trace_category": ctx.persist.trace_category,
+        "chat_type": ctx.persist.chat_type or "normal",
+        "mode": getattr(ctx.persist, "mode", "") or "managed",
+        "kind": getattr(ctx.persist, "kind", "") or "",
+    })
     if commit:
         conn.commit()
 
@@ -478,47 +623,51 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
         _lock_type = lock_type_snapshot  # 可能为 None（无锁）
         _is_modified = int(is_modified_snapshot)
         _mod_note = mod_note_snapshot
-    conn.execute("""
+    _exec(conn, """
         UPDATE requests SET
-            duration_ms = ?, status_code = ?,
-            total_input_tokens = ?, output_tokens = ?,
-            total_tokens = ?,
-            cache_hit_tokens = ?, cache_miss_tokens = ?,
-            cache_hit_ratio = ?,
-            cache_creation_tokens = ?,
-            has_reasoning = ?, has_tool_calls = ?,
-            jsonl_path = ?,
-            jsonl_offset = ?,
-            lock_type = ?,
-            prefix_chain_id = ?,
-            is_modified = ?,
-            modification_note = ?,
-            system_role_converted = ?,
-            sys_tools_locked = ?,
+            duration_ms = %(duration_ms)s, status_code = %(status_code)s,
+            total_input_tokens = %(total_input_tokens)s, output_tokens = %(output_tokens)s,
+            total_tokens = %(total_tokens)s,
+            cache_hit_tokens = %(cache_hit_tokens)s, cache_miss_tokens = %(cache_miss_tokens)s,
+            cache_hit_ratio = %(cache_hit_ratio)s,
+            cache_creation_tokens = %(cache_creation_tokens)s,
+            has_reasoning = %(has_reasoning)s, has_tool_calls = %(has_tool_calls)s,
+            jsonl_path = %(jsonl_path)s,
+            jsonl_offset = %(jsonl_offset)s,
+            lock_type = %(lock_type)s,
+            prefix_chain_id = %(prefix_chain_id)s,
+            is_modified = %(is_modified)s,
+            modification_note = %(modification_note)s,
+            system_role_converted = %(system_role_converted)s,
+            sys_tools_locked = %(sys_tools_locked)s,
+            intervention = %(intervention)s,
+            intervention_note = %(intervention_note)s,
             record_state = 'completed'
-        WHERE request_id = ?
-    """, (
-        ctx.duration_ms or ctx.elapsed_ms,
-        ctx.status,
-        prompt_tokens,
-        completion_tokens,
-        prompt_tokens + completion_tokens,
-        ctx.persist.cache_hit_tokens,
-        ctx.persist.cache_miss_tokens,
-        ctx.persist.cache_hit_ratio,
-        ctx.persist.cache_creation_tokens,
-        int(ctx.persist.has_reasoning),
-        int(ctx.persist.has_tool_calls),
-        jsonl_path,
-        ctx.meta.get("jsonl_offset", 0),
-        _lock_type,
-        ctx.persist.prefix_chain_id or None,
-        _is_modified,
-        _mod_note,
-        int(ctx.persist.system_role_converted),
-        ctx.persist.sys_tools_locked or None,
-        ctx.req_id,
-    ))
+        WHERE request_id = %(request_id)s
+    """, {
+        "duration_ms": ctx.duration_ms or ctx.elapsed_ms,
+        "status_code": ctx.status,
+        "total_input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cache_hit_tokens": ctx.persist.cache_hit_tokens,
+        "cache_miss_tokens": ctx.persist.cache_miss_tokens,
+        "cache_hit_ratio": ctx.persist.cache_hit_ratio,
+        "cache_creation_tokens": ctx.persist.cache_creation_tokens,
+        "has_reasoning": int(ctx.persist.has_reasoning),
+        "has_tool_calls": int(ctx.persist.has_tool_calls),
+        "jsonl_path": jsonl_path,
+        "jsonl_offset": ctx.meta.get("jsonl_offset", 0),
+        "lock_type": _lock_type,
+        "prefix_chain_id": ctx.persist.prefix_chain_id or None,
+        "is_modified": _is_modified,
+        "modification_note": _mod_note,
+        "system_role_converted": int(ctx.persist.system_role_converted),
+        "sys_tools_locked": ctx.persist.sys_tools_locked or None,
+        "intervention": int(_is_modified),
+        "intervention_note": _mod_note or "",
+        "request_id": ctx.req_id,
+    })
     if commit:
         conn.commit()
 
@@ -528,10 +677,10 @@ def update_request_phase2(conn: sqlite3.Connection, ctx, *,
 
 def get_request_jsonl_info(conn: sqlite3.Connection, request_id: str) -> dict | None:
     """Get (jsonl_path, jsonl_offset) for a request."""
-    row = conn.execute("""
+    row = _exec(conn, """
         SELECT jsonl_path, jsonl_offset FROM requests
-        WHERE request_id = ?
-    """, (request_id,)).fetchone()
+        WHERE request_id = %(request_id)s
+    """, {"request_id": request_id}).fetchone()
     return dict(row) if row else None
 
 
@@ -539,53 +688,26 @@ def get_previous_by_session_id(
     conn, session_id: str, exclude_req_id: str,
 ) -> tuple[str | None, int] | None:
     """Get (msg_hash_chain, prompt_messages_count) by session_id."""
-    row = conn.execute("""
+    row = _exec(conn, """
         SELECT msg_hash_chain, prompt_messages_count FROM requests
-        WHERE session_id = ? AND request_id != ?
+        WHERE session_id = %(session_id)s AND request_id != %(exclude_req_id)s
           AND msg_hash_chain IS NOT NULL
         ORDER BY id DESC LIMIT 1
-    """, (session_id, exclude_req_id)).fetchone()
+    """, {"session_id": session_id, "exclude_req_id": exclude_req_id}).fetchone()
     if row and row["msg_hash_chain"]:
         return (row["msg_hash_chain"], row["prompt_messages_count"])
     return None
-
-
-def get_previous_by_fingerprint(
-    conn, fingerprint: str, exclude_req_id: str,
-) -> tuple[str | None, int] | None:
-    """Get (msg_hash_chain, prompt_messages_count) by session_fingerprint."""
-    row = conn.execute("""
-        SELECT msg_hash_chain, prompt_messages_count FROM requests
-        WHERE session_fingerprint = ? AND request_id != ?
-          AND msg_hash_chain IS NOT NULL
-        ORDER BY id DESC LIMIT 1
-    """, (fingerprint, exclude_req_id)).fetchone()
-    if row and row["msg_hash_chain"]:
-        return (row["msg_hash_chain"], row["prompt_messages_count"])
-    return None
-
-
-def get_previous_jsonl_by_fingerprint(
-    conn, fingerprint: str, exclude_req_id: str,
-) -> tuple[str, str, int] | None:
-    """Get (jsonl_path, request_id, jsonl_offset) by session_fingerprint."""
-    row = conn.execute("""
-        SELECT jsonl_path, request_id, jsonl_offset FROM requests
-        WHERE session_fingerprint = ? AND request_id != ? AND jsonl_path != ''
-        ORDER BY id DESC LIMIT 1
-    """, (fingerprint, exclude_req_id)).fetchone()
-    return (row["jsonl_path"], row["request_id"], row["jsonl_offset"] or 0) if row else None
 
 
 def get_previous_jsonl_by_session_id(
     conn, session_id: str, exclude_req_id: str,
 ) -> tuple[str, str, int] | None:
     """Get (jsonl_path, request_id, jsonl_offset) by session_id."""
-    row = conn.execute("""
+    row = _exec(conn, """
         SELECT jsonl_path, request_id, jsonl_offset FROM requests
-        WHERE session_id = ? AND request_id != ? AND jsonl_path != ''
+        WHERE session_id = %(session_id)s AND request_id != %(exclude_req_id)s AND jsonl_path != ''
         ORDER BY id DESC LIMIT 1
-    """, (session_id, exclude_req_id)).fetchone()
+    """, {"session_id": session_id, "exclude_req_id": exclude_req_id}).fetchone()
     return (row["jsonl_path"], row["request_id"], row["jsonl_offset"] or 0) if row else None
 
 
@@ -640,3 +762,31 @@ def cleanup_prefix_chains_id(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# ── Meta table (checkpoint_offset) ──
+
+
+def create_meta_table(conn: sqlite3.Connection) -> None:
+    """Key-value meta table，存 checkpoint_offset 等。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    conn.commit()
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = _exec(conn, "SELECT value FROM meta WHERE key = %(key)s",
+                {"key": key}).fetchone()
+    if row is None:
+        return None
+    # PG dict_row vs SQLite Row：统一键访问
+    return row["value"] if isinstance(row, dict) else row[0]
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str, *, commit: bool = True) -> None:
+    _exec(conn,
+        "INSERT INTO meta (key, value) VALUES (%(key)s, %(value)s) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        {"key": key, "value": value},
+    )
+    if commit:
+        conn.commit()

@@ -13,6 +13,7 @@ dependencies = [
     "aiohttp>=3.9",
     "pyyaml>=6.0",
     "xxhash>=3.7",
+    "orjson>=3.10",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -27,6 +28,7 @@ Repository = "https://github.com/intinvoker/deepseek-tap-proxy"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "pytest-cov", "pytest-timeout"]
+postgres = ["psycopg[binary]>=3.1"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -36,3 +38,6 @@ deepseek-tap-proxy = "deepseek_tap_proxy.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+deepseek_tap_proxy = ["**/*.txt"]

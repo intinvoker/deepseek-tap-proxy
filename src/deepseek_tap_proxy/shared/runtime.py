@@ -25,6 +25,7 @@ class Runtime:
     config: object | None = None            # ProxyConfig — 避免循环引用
     transport: object | None = None          # Transport
     router: object | None = None             # UpstreamRouter
+    policies: object | None = None           # PolicyResolver（passthrough/adapter/managed）
     upstream_config: object | None = None    # ResolvedTarget
     pipeline_factory: dict | None = None    # {"generic": Pipeline} 或类似
     session: object | None = None            # aiohttp.ClientSession — 迁移过渡

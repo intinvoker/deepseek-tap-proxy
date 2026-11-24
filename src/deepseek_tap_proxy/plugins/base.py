@@ -8,10 +8,16 @@ from deepseek_tap_proxy.pipeline import Stage, Context
 
 @dataclass(frozen=True)
 class DetectionResult:
-    """纯检测产出。session_id 始终从请求内容提取。"""
+    """纯检测产出。session_id 始终从请求内容提取。
+
+    chain_id / parent_chain_id 为内部身份字段 —— 由各客户端适配器
+    从外部协议转化而来，服务内一律使用这两个名字。
+    """
     client_type: str
     chat_type: str
     session_id: str
+    chain_id: str = ""
+    parent_chain_id: str = ""
 
 
 class Plugin(Protocol):

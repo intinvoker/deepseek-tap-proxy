@@ -15,6 +15,12 @@ def detect_claude_code(ctx: Context) -> DetectionResult | None:
     if not sid:
         return None
 
+    # ── 外部协议 → 内部字段（本模块是唯一的转化点）──
+    # 子代理复用主会话的 session-id，靠 agent-id 区分独立的链。
+    # 主代理请求不带 agent-id → chain_id 为空串，此处不做任何回落/推导。
+    chain_id = headers.get("x-claude-code-agent-id", "")
+    parent_chain_id = headers.get("x-claude-code-parent-agent-id", "")
+
     chat_type = "normal"
     # auto_title 检测（如果可用）
     try:
@@ -28,4 +34,6 @@ def detect_claude_code(ctx: Context) -> DetectionResult | None:
         client_type="claude-code",
         chat_type=chat_type,
         session_id=sid,
+        chain_id=chain_id,
+        parent_chain_id=parent_chain_id,
     )

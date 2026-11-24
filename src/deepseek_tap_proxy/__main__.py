@@ -103,9 +103,10 @@ async def async_main() -> None:
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
-        pass
+        log.info("Proxy received shutdown signal (SIGINT) — draining writes, closing")
     finally:
         await runner.cleanup()
+        log.info("Proxy stopped cleanly")
 
 
 def main() -> None:

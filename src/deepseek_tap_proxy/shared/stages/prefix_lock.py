@@ -3,7 +3,7 @@
 匹配 session 的前缀链，锁定 sys/tools/messages 到前缀值以最大化缓存命中。
 通过 MemoryStore 读取（0 I/O），SQLite 落盘为 fire-and-forget。
 
-匹配策略 (v2, 2026-06-12):
+匹配策略 (v2):
   - messages 段: 先提取 stable prefix（倒数第二个 user 之前），再双向匹配
   - sys/tools 段: 全量位置化匹配（SysToolsLock 已保证稳定）
   - 锁定: chain[:fc] + curr[fc:n-bc] + chain[n-bc:] + current_round
@@ -22,6 +22,24 @@ from deepseek_tap_proxy.shared.stages.helpers import (
 from deepseek_tap_proxy.shared.chain import find_anchor_moment
 
 log = logging.getLogger("deepseek-tap")
+
+
+def _explicit_non_streaming(ctx: Context) -> bool:
+    """显式 stream:false 才旁路锁定（缺省 stream 按流式处理——
+    真实 Copilot/Claude Code 均流式；title 生成/批量显式 false）。"""
+    body = ctx.body_readonly
+    return isinstance(body, dict) and body.get("stream") is False
+
+
+def _has_web_search(ctx: Context) -> bool:
+    """检测请求 body 是否声明 web_search 工具（打破前缀缓存，跳过匹配与锁定）。"""
+    body = getattr(ctx, "body_readonly", None)
+    if not isinstance(body, dict):
+        return False
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    return any(isinstance(t, dict) and t.get("type") == "web_search" for t in tools)
 
 
 def _classify_pref_fail(
@@ -112,6 +130,12 @@ class PrefixLockStage(Stage):
 
     async def process(self, ctx: Context) -> Context:
         if not self.enabled:
+            return ctx
+
+        # web_search 工具打破前缀缓存（搜索注入动态内容）：跳过前缀匹配与锁定，
+        # 请求原样透传，不污染链（多协议 LLM webSearch 场景，2026-08）
+        if _has_web_search(ctx):
+            ctx.meta["cache_skipped"] = "web_search"
             return ctx
 
         if ctx.chat_type == "compaction":
@@ -298,7 +322,12 @@ class PrefixLockStage(Stage):
                 )
                 msg_bc = adjusted_bc
 
-        if lock_type != "layer1_perfect":
+        # 显式非流式请求（title 生成/批量）：旁路锁定改写（原样透传，is_modified=0），
+        # 但保留匹配结果 lock_type（S2 期望有效锁类型记录）与链延续
+        if _explicit_non_streaming(ctx):
+            locked_sys, locked_tools, locked_msgs = sys_c, tools_c, msgs_c
+
+        if lock_type != "layer1_perfect" and not _explicit_non_streaming(ctx):
             ctx.persist.is_modified = True
         ctx.meta["log_msgs_after"] = len(locked_sys) + len(locked_tools) + len(locked_msgs)
 

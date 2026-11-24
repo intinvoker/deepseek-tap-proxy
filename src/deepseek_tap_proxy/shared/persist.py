@@ -49,6 +49,11 @@ class PersistRecord:
     prefix_chain_id: str = ""
 
     # ── 链操作（引用 chain_action，不拷贝重量数据） ──
+    # ⚠️ 与 ctx.chain_id（Context 上的身份字段）同名不同义 ——
+    #    本字段当前是「前缀链」标识，由 sys/tools/messages 哈希派生；
+    #    而 ctx.chain_id 是「请求身份」，由适配器从外部协议转化。
+    #    收敛后本字段改由身份写入；在此之前两者
+    #    在一次请求上取值不同，写入/读取时必须指明是哪一个。
     chain_id: str = ""
     chain_action: str = ""         # "create" | "update" | ""
     chain_msg_count: int = 0
@@ -79,3 +84,12 @@ class PersistRecord:
 
     # ── 请求分类 ──
     topic: str = ""                  # "chat" | "count_tokens" | "passthrough" | "rejected" | ""
+
+    # ── 模式 / 端点类型 / 干预 / usage 可信度（passthrough-policy 引入）──
+    # mode: passthrough | adapter | managed —— 决定走哪条管线；
+    # kind: chat | search | fetch | other —— 端点语义（搜索/抓取新 API 留痕用）；
+    # intervention: 是否对请求做过改写（与 is_modified 同源，见 DB 列）；
+    # usage_source: parsed | unparsed —— usage 解析是否成功（尽力而为）。
+    mode: str = "managed"
+    kind: str = ""
+    usage_source: str = ""

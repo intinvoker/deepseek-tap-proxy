@@ -18,8 +18,8 @@ class Stage(ABC):
 class PipelineObserver(Protocol):
     """Pipeline 执行观察者 — 纯数据采集，不参与也不影响 pipeline 执行。
 
-    Inspector 实现此协议，在每个 stage 前后采集 ctx 快照。
-    生产环境传 None，零开销。
+    调试工具可实现此协议，在每个 stage 前后采集 ctx 快照。
+    默认传 None，零开销。
     """
 
     def on_stage_start(self, stage: Stage, ctx: Context) -> None:

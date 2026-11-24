@@ -15,13 +15,31 @@ from aiohttp import web
 
 from deepseek_tap_proxy.pipeline import Context, Stage
 from deepseek_tap_proxy.shared.decompress import decompress_body
-from deepseek_tap_proxy.shared.headers import filter_hop_by_hop
+from deepseek_tap_proxy.shared.headers import prepare_fwd_headers
 from deepseek_tap_proxy.anthropic.sse import AnthropicReconstructor
-from deepseek_tap_proxy.anthropic.usage import normalize_anthropic_usage
+from deepseek_tap_proxy.shared.usage import REGISTRY, detect_vendor
+
+
+def _extract_usage_meta(ctx: Context) -> dict:
+    """经 Usage 抽象层提取 usage（meta 观测用，与 resp_usage 同源）。"""
+    raw = ctx.resp_body.get("usage", {}) if ctx.resp_body else {}
+    vendor = ctx.meta.get("upstream_name", "") or detect_vendor(raw)
+    return REGISTRY.extract(raw, "anthropic", vendor)
 
 log = logging.getLogger("deepseek-tap")
 
 _ALLOWED_PATH_PREFIXES = ("/v1/messages", "/v1/complete", "/v1/models")
+
+
+def _response_headers_with_request_id(headers, req_id: str) -> dict:
+    """响应头副本：先剔除上游同名 ``x-request-id``（大小写不敏感）再注入 proxy id。
+
+    上游可能自带 x-request-id（例如上游网关透传），不剔除会产生重复头；
+    proxy 的 ``ctx.req_id`` 才是与 trace/日志可关联的权威 id。
+    """
+    out = {k: v for k, v in headers.items() if k.lower() != "x-request-id"}
+    out["X-Request-Id"] = req_id
+    return out
 
 
 def _is_allowed_path(path: str) -> bool:
@@ -68,10 +86,9 @@ class AnthropicParseStage(Stage):
                 ctx.response = web.Response(status=400, text="Invalid JSON")
                 return ctx
 
-        fwd_headers = dict(ctx.request.headers)
-        fwd_headers.pop("Host", None)
-        fwd_headers = filter_hop_by_hop(fwd_headers)
-        ctx.fwd_headers = fwd_headers
+        # 转发头走唯一入口：去 Host / 去 hop-by-hop / 强制 Accept-Encoding: identity
+        # （覆盖客户端 zstd 声明，否则上游压缩响应而 aiohttp 无解码器 → 全线 502）
+        ctx.fwd_headers = prepare_fwd_headers(ctx.request.headers)
 
         rt = ctx.request.get("runtime")
         if rt is not None:
@@ -110,7 +127,7 @@ class AnthropicBlock0ClearStage(Stage):
 
     Only clears sys[0].text when it starts with the known billing header
     prefix (``x-anthropic-billing-header:``).  Non-billing sys[0] blocks
-    (Hermes persona, Claude Code prompts, etc.) are left untouched so
+    (client system prompts, etc.) are left untouched so
     their prefix cache matches are preserved.
     """
 
@@ -241,10 +258,11 @@ class AnthropicForwardStage(Stage):
             ctx.response = web.Response(status=502, text="Transport not configured")
             return ctx
 
-        # 记录 upstream_name（从 Runtime 读取）
-        upstream_config = rt.upstream_config
-        if upstream_config is not None:
-            ctx.meta["upstream_name"] = getattr(upstream_config, 'upstream_name', 'default')
+        # 记录 upstream_name（请求级 ResolvedTarget——Runtime 是共享单例，
+        # 请求级数据必须从 request['upstream'] 读，否则日志永远显示 default）
+        upstream = ctx.request.get("upstream")
+        if upstream is not None:
+            ctx.meta["upstream_name"] = getattr(upstream, 'upstream_name', 'default')
 
         # 通过 Transport 获取上游响应
         resp = await rt.transport.fetch(ctx)
@@ -262,18 +280,23 @@ class AnthropicForwardStage(Stage):
             ctx.duration_ms = ctx.elapsed_ms
             ctx.response = web.Response(
                 status=resp.status,
-                headers=resp.headers,
+                headers=_response_headers_with_request_id(resp.headers, ctx.req_id),
                 body=resp.raw_bytes,
             )
             if ctx.resp_body:
-                ctx.meta["usage"] = normalize_anthropic_usage(ctx.resp_body.get("usage", {}))
+                ctx.meta["usage"] = _extract_usage_meta(ctx)
 
         from deepseek_tap_proxy.shared.stages import apply_cache_analysis
         apply_cache_analysis(ctx)
         return ctx
 
     async def _relay_stream(self, ctx: Context, stream: collections.abc.AsyncIterable[bytes]) -> None:
-        resp = web.StreamResponse(status=200, headers=ctx.resp_headers)
+        # 流式响应头只能在 prepare() 之前注入（prepare 后头已发出，ReturnStage
+        # 再改无效）。先剔除上游同名 x-request-id，再写 proxy 统一 ctx.req_id。
+        resp = web.StreamResponse(
+            status=200,
+            headers=_response_headers_with_request_id(ctx.resp_headers, ctx.req_id),
+        )
         await resp.prepare(ctx.request)
         ctx.response = resp
         reconstructor = AnthropicReconstructor()
@@ -290,7 +313,7 @@ class AnthropicForwardStage(Stage):
         ctx.resp_body = reconstructor.reconstruct()
         ctx.meta["sse_events"] = reconstructor.events
         if ctx.resp_body:
-            ctx.meta["usage"] = normalize_anthropic_usage(ctx.resp_body.get("usage", {}))
+            ctx.meta["usage"] = _extract_usage_meta(ctx)
 
     async def _relay_non_stream(self, ctx: Context, upstream_resp) -> None:
         resp_bytes = await upstream_resp.read()
@@ -312,7 +335,7 @@ class AnthropicForwardStage(Stage):
         except (orjson.JSONDecodeError, json.JSONDecodeError, ValueError):
             ctx.resp_body = None
         if ctx.resp_body:
-            ctx.meta["usage"] = normalize_anthropic_usage(ctx.resp_body.get("usage", {}))
+            ctx.meta["usage"] = _extract_usage_meta(ctx)
         ctx.response = web.Response(
             status=upstream_resp.status, headers=ctx.resp_headers, body=resp_bytes,
         )
@@ -321,4 +344,11 @@ class AnthropicForwardStage(Stage):
 class ReturnStage(Stage):
     async def process(self, ctx: Context) -> Context:
         ctx.should_abort = True
+        # 兜底：任何**未 prepare** 的响应（非流式 ForwardStage 之外的本地
+        # 构造响应）补 X-Request-Id = ctx.req_id。已 prepare 的流式响应头已发出，
+        # 不再尝试修改；已有同值不重复写（上游不同值则替换为 proxy id）。
+        resp = ctx.response
+        if resp is not None and not getattr(resp, "prepared", False):
+            if resp.headers.get("X-Request-Id") != ctx.req_id:
+                resp.headers["X-Request-Id"] = ctx.req_id
         return ctx

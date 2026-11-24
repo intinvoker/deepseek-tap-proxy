@@ -6,12 +6,14 @@ from deepseek_tap_proxy.plugins.vscode_copilot.plugin import VSCodeCopilotPlugin
 from deepseek_tap_proxy.plugins.vscode_copilot_deepseek.plugin import VSCodeCopilotDeepSeekPlugin
 from deepseek_tap_proxy.plugins.hermes.plugin import HermesPlugin
 from deepseek_tap_proxy.plugins.claude_code.plugin import ClaudeCodePlugin
+from deepseek_tap_proxy.plugins.dsh.plugin import DshPlugin
 
 ALL_PLUGINS: list[Plugin] = [
     VSCodeCopilotPlugin(),
     VSCodeCopilotDeepSeekPlugin(),
     HermesPlugin(),
     ClaudeCodePlugin(),
+    DshPlugin(),
 ]
 
 

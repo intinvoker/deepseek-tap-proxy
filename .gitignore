@@ -31,3 +31,9 @@ data/
 
 # Config (contains API keys)
 upstreams.yaml
+
+# Worktrees
+.worktrees/
+
+# 本地真实数据样本（不随仓库分发）
+tests/fixtures/

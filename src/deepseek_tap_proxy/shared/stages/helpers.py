@@ -177,7 +177,7 @@ async def create_chain_moment(ctx, store) -> None:
     op = "compact" if ctx.chat_type == "compaction" else (
         ctx.chain_action.action if ctx.chain_action else "create"
     )
-    # TUI 对齐: messages_count = conversation messages only（不含 sys/tools）
+    # 对齐: messages_count = conversation messages only（不含 sys/tools）
     # 确保 find_anchor_moment(pref_hit) 比较时单位一致：
     #   pref_hit = sys_fc + tools_fc + msg_fc + msg_bc（hash 命中数）
     #   messages_count = len(ctx.messages)（对话消息数）
@@ -397,7 +397,7 @@ def _ensure_frozen_chain(
             "cache_miss_tokens": estimated.cache_miss_tokens,
             "char_count": estimated.char_count,
             "timestamp": estimated.timestamp,
-        }]),
+        }]).decode(),
     )
 
     return estimated

@@ -60,6 +60,37 @@ class UpstreamRouter:
         names = [n for n, _, _, _ in self._upstreams]
         log.info(f"[upstream] loaded {len(self._upstreams)} upstreams: {names}, default={self._default}")
 
+    def reload(self) -> tuple[bool, str]:
+        """运行时重载配置文件（原子替换，失败保持旧配置）。
+
+        Returns:
+            (ok, message): ok=False 时保留旧配置继续服务（不破坏运行中请求）。
+        """
+        if not self._config_path:
+            return False, "no config path (router disabled)"
+        try:
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            new_default = data.get("default", "")
+            new_upstreams: list[tuple[str, str, list[str], str | None]] = []
+            for name, cfg in (data.get("upstreams", {}) or {}).items():
+                target = cfg.get("target", "")
+                keys = cfg.get("keys", [])
+                if target and keys:
+                    new_upstreams.append((name, target, keys, cfg.get("path_prefix")))
+            if not new_upstreams and self._upstreams:
+                return False, "new config has no upstreams (refusing to empty router)"
+            # 原子替换：resolve 每次读 _upstreams/_default（GIL 下引用替换对读线程安全）
+            self._default = new_default
+            self._upstreams = new_upstreams
+            names = [n for n, _, _, _ in self._upstreams]
+            log.info(f"[upstream] reloaded {len(self._upstreams)} upstreams: {names}, default={self._default}")
+            return True, f"reloaded {len(new_upstreams)} upstreams: {names}, default={new_default}"
+        except FileNotFoundError:
+            return False, f"config file not found: {self._config_path}"
+        except Exception as exc:
+            return False, f"failed to reload config: {exc}"
+
     def resolve(self, auth_header: str | None) -> ResolvedTarget | None:
         if not self._upstreams:
             return None

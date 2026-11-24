@@ -113,6 +113,12 @@ class LogView:
         else:
             slock_kv = ""
 
+        # ── 身份前缀：仅非空时显示（主代理日志零变化）──
+        # 追加在 slock 组装「之后」——子代理首次是 init、稳定期是 pass，
+        # 只在 action=="lock" 分支里加会让最该被观测的场景没有输出。
+        if c.chain_id:
+            slock_kv = f"{slock_kv} chain={c.chain_id[:8]}".strip()
+
         # ── cache ──
         cache_hit = r.cache_hit_tokens or c.meta.get("cache_hit_tokens", 0)
         cache_miss = r.cache_miss_tokens or c.meta.get("cache_miss_tokens", 0)
@@ -313,6 +319,49 @@ class LogView:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+# 截断计数（/health 消费）— 证明写入侧有界的度量闭环
+RESP_TRUNCATED_COUNT = 0
+
+
+def get_truncated_count() -> int:
+    return RESP_TRUNCATED_COUNT
+
+
+def _truncate_strings(obj, limit: int):
+    """递归截断 dict/list 中超长字符串（保留结构）。与 viewer 展示层同构。"""
+    if isinstance(obj, str):
+        if len(obj) > limit:
+            return obj[:limit] + f"\n...[truncated, {len(obj)} chars total]"
+        return obj
+    if isinstance(obj, dict):
+        return {k: _truncate_strings(v, limit) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_truncate_strings(v, limit) for v in obj]
+    return obj
+
+
+def truncate_resp_body(body, max_bytes: int) -> tuple:
+    """结构内截断响应体，使 trace_record 字节有界（单请求内存峰值上限）。
+
+    截断作用于 ctx.resp_body 聚合副本（转发流不受影响）。语义与 viewer
+    展示层 _truncate_body 一致：外层结构与头部字段保留，长字符串截断。
+    返回 (new_body, was_truncated)。
+    """
+    if body is None or max_bytes <= 0:
+        return body, False
+    size = len(orjson.dumps(body))
+    if size <= max_bytes:
+        return body, False
+    # 保守：单字符串上限 = 阈值 1/4（结构开销 + 多字段冗余）
+    limit = max(max_bytes // 4, 1024)
+    body = _truncate_strings(body, limit)
+    body["_truncated"] = True
+    body["_original_bytes"] = size
+    global RESP_TRUNCATED_COUNT
+    RESP_TRUNCATED_COUNT += 1
+    return body, True
+
+
 class TraceView:
     """Raw request/response archive for debugging and replay.
 
@@ -343,6 +392,10 @@ class TraceView:
             "upstream_name": c.meta.get("upstream_name", "default"),
             "api_format": r.api_format,
             "topic": c.topic,
+            "mode": r.mode or "managed",
+            "kind": r.kind or "",
+            "intervention": 1 if r.is_modified else 0,
+            "usage_source": r.usage_source or "",
             "request": {
                 "method": c.request.method,
                 "path": c.request.path_qs,
@@ -412,7 +465,7 @@ class TraceWriter:
         day_dir = self.run_dir / today
         day_dir.mkdir(parents=True, exist_ok=True)
         name = "traces.jsonl" if self._file_seq == 1 else f"traces-{self._file_seq}.jsonl"
-        self._file = open(day_dir / name, "a", encoding="utf-8")
+        self._file = open(day_dir / name, "ab")
         self.path = day_dir / name
 
     def _flush_locked(self) -> None:
@@ -436,7 +489,7 @@ class TraceWriter:
                 self._open_file(today)
             record["run_id"] = self.run_id
             offset = self._file.tell()
-            self._file.write(orjson.dumps(_coerce_keys(record)).decode() + "\n")
+            self._file.write(orjson.dumps(_coerce_keys(record)) + b"\n")
             self._pending_count += 1
             self.count += 1
             self._update_stats(record)
@@ -554,6 +607,14 @@ def _build_otlp_record(ctx, run_id: str) -> dict:
     _str_attr("model", model)
     _str_attr("session_id", ctx.session_id or "")
     _str_attr("kind", "request")
+    # passthrough-policy：模式 / 端点类型 / 干预 / usage 可信度（所有 topic 都带）
+    _persist = getattr(ctx, "persist", None)
+    if _persist is not None:
+        _str_attr("mode", getattr(_persist, "mode", "") or "managed")
+        _str_attr("request_kind", getattr(_persist, "kind", "") or "")
+        _int_attr("intervention", 1 if getattr(_persist, "is_modified", False) else 0)
+        if getattr(_persist, "usage_source", ""):
+            _str_attr("usage_source", _persist.usage_source)
 
     # ── Topic-specific attributes ──
     topic = getattr(ctx, "topic", None) or ""
@@ -581,8 +642,10 @@ def _build_otlp_record(ctx, run_id: str) -> dict:
 def _chat_otlp_attrs(ctx) -> list[dict]:
     """chat topic 的 OTLP 专属字段 —— OTLP 是持久化超集（除原始 body/headers）。
 
-    字段对齐 PersistRecord（见 2026-07-31-proxy-persist-field-lineage-design.md §5）。
+    字段对齐 PersistRecord。
     """
+    from deepseek_tap_proxy.shared.cache_attribution import cache_attribution
+
     c = ctx
     p = ctx.persist
     ca = getattr(c, "chain_action", None)
@@ -604,6 +667,11 @@ def _chat_otlp_attrs(ctx) -> list[dict]:
     s("session_method", c.session_method or "")
     s("upstream_name", c.meta.get("upstream_name", "default"))
     s("session_id", c.session_id or "")
+    # session key 来源观测（fingerprint 退役 V2）：plugin=检测器给出 session_id；none=无会话键
+    s("session_key_source", c.meta.get("session_key_source", "?"))
+    # 链谱系（缓存归因 / 超集分析用）：优先 ctx.chain_id，回退到 chain_action 的链（完整值，不截断）
+    s("chain_id", getattr(c, "chain_id", "") or (ca.chain_id if ca and ca.chain_id else ""))
+    s("parent_chain_id", getattr(c, "parent_chain_id", "") or "")
     s("trace_category", getattr(p, "trace_category", "") or "")
     s("session_uuid", c.meta.get("session_uuid", "") or "")
     # 请求
@@ -634,11 +702,14 @@ def _chat_otlp_attrs(ctx) -> list[dict]:
     i("pref_sys_hit", c.meta.get("pref_sys_hit", 0))
     i("pref_tools_hit", c.meta.get("pref_tools_hit", 0))
     i("pref_msgs_hit", c.meta.get("pref_msgs_hit", c.meta.get("pref_hit_count", 0)))
+    # 缓存归因（客户端侧匹配原因 + 期望命中 vs 实际命中差距）
+    attr = cache_attribution(c)
+    s("cache_match_reason", attr["cache_match_reason"])
+    i("cache_expected_hit_tokens", attr["cache_expected_hit_tokens"])
+    i("cache_hit_gap", attr["cache_hit_gap"])
     # 链
     if ca and ca.action:
         s("chain_action", ca.action)
-        if ca.chain_id:
-            s("chain_id", ca.chain_id[:16])
 
     return attrs
 

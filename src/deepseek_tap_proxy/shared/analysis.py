@@ -1,21 +1,12 @@
-"""Request analysis: client_type, intent, session — format-aware, with optional DB persistence."""
-
+"""Request analysis: client_type, intent, hash-chain matching — format-aware."""
 from __future__ import annotations
-import hashlib
-import re
 
-from deepseek_tap_proxy.shared.session import Session
 from deepseek_tap_proxy.shared.hash import msg_hash
 
 
 # ── Constants ──
 
 COMPACTION_SIGNATURE = "Your task is to create a comprehensive, detailed summary"
-
-_SESSION_UUID_RE = re.compile(
-    r'GitHub\.copilot-chat[\\/](?:debug-logs|transcripts)[\\/]'
-    r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
-)
 
 # ── Client type detection ──
 
@@ -52,90 +43,15 @@ def detect_intent_openai(client_type: str, msgs: list[dict]) -> str:
     return "normal"
 
 
-# ── Session resolution ──
-_HERMES_SESSION_ID_RE = re.compile(
-    r'(?:^|\n)\s*(?:Current )?Session\s+ID[:\s]+(\S+)', re.IGNORECASE
-)
-
-
-def extract_copilot_uuid(text: str) -> str | None:
-    m = _SESSION_UUID_RE.search(text)
-    return m.group(1) if m else None
-
-
-def extract_hermes_uuid(text: str) -> str | None:
-    """Extract Hermes session ID from msg[0] content."""
-    m = _HERMES_SESSION_ID_RE.search(text)
-    return m.group(1) if m else None
-
-
-def _compute_fingerprint(msgs: list[dict], start: int, count: int) -> str | None:
-    parts = []
-    for i in range(start, min(len(msgs), start + count)):
-        c = msgs[i].get("content", "")
-        if isinstance(c, str):
-            parts.append(c)
-        else:
-            return None
-    if not parts:
-        return None
-    return hashlib.md5(("<<<MSG>>>".join(parts)).encode()).hexdigest()[:16]
-
-
-def resolve_session_openai(msgs: list[dict]) -> Session:
-    """Resolve Session from OpenAI-format messages.
-
-    Copilot uses UUID as primary key (extracted from msg[0] path),
-    with fingerprint fallback. Hermes/generic always use fingerprint.
-    """
-    client_type = detect_client_type_openai(msgs)
-
-    if client_type in ("vscode-copilot", "vscode-copilot-deepseek"):
-        uuid = extract_copilot_uuid(msgs[0].get("content", "") if msgs else "")
-        fingerprint = _compute_fingerprint(msgs, 1, 2) or "unknown"
-        key = uuid or fingerprint
-    elif client_type == "hermes":
-        fingerprint = _compute_fingerprint(msgs, 1, 4) or "unknown"
-        key = fingerprint
-    else:
-        fingerprint = _compute_fingerprint(msgs, 0, 4) or "unknown"
-        key = fingerprint
-
-    return Session(key=key, client_type=client_type, fingerprint=fingerprint)
-
-
 # ── Anthropic detection ──
 
 
 def detect_client_type_anthropic(headers: dict) -> str:
-    """Anthropic client detection. Only Claude Code has a reliable fingerprint."""
+    """Anthropic client detection. Only Claude Code exposes a session-id header."""
     sid = headers.get("x-claude-code-session-id", "")
     if sid:
         return "claude-code"
     return "generic"
-
-
-def resolve_session_anthropic(system, headers: dict) -> Session:
-    """Resolve Session from Anthropic-format request."""
-    client_type = detect_client_type_anthropic(headers)
-    msgs_for_fp = _system_to_msgs(system)
-    if client_type == "claude-code":
-        key = headers.get("x-claude-code-session-id", "")
-    else:
-        key = ""
-    fingerprint = _compute_fingerprint(msgs_for_fp, 0, len(msgs_for_fp)) or "unknown"
-    if not key:
-        key = fingerprint
-    return Session(key=key, client_type=client_type, fingerprint=fingerprint)
-
-
-def _system_to_msgs(system) -> list[dict]:
-    """Convert Anthropic system field to list[dict] for fingerprint computation."""
-    if isinstance(system, str):
-        return [{"role": "system", "content": system}]
-    if isinstance(system, list):
-        return [{"role": "system", "content": str(b)} for b in system]
-    return []
 
 
 # ── Hash chain matching (used by RequestAnalysisStage._match_or_create) ──

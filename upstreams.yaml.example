@@ -16,7 +16,7 @@ upstreams:
       - "tp-"
 
   # custom:
-  #   target: http://localhost:43001
+  #   target: https://your-upstream.example.com
   #   keys:
   #     - "sk-custom-"
   #   path_prefix: /v1/messages  # Override Anthropic upstream path (optional)

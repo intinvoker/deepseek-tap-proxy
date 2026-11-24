@@ -20,7 +20,7 @@ from aiohttp import web
 
 from deepseek_tap_proxy.pipeline import Context, Stage
 from deepseek_tap_proxy.shared.decompress import decompress_body
-from deepseek_tap_proxy.shared.headers import filter_hop_by_hop
+from deepseek_tap_proxy.shared.headers import prepare_fwd_headers
 from deepseek_tap_proxy.shared.stages import apply_cache_analysis
 from deepseek_tap_proxy.openai.sse import OpenaiReconstructor
 
@@ -105,18 +105,14 @@ class ParseStage(Stage):
     async def process(self, ctx: Context) -> Context:
         body = await ctx.request.read()
 
-        fwd_headers = dict(ctx.request.headers)
-        fwd_headers.pop("Host", None)
-        fwd_headers = filter_hop_by_hop(fwd_headers)
-
         req_content_encoding = ctx.request.headers.get("Content-Encoding", "").lower()
         if req_content_encoding in ("zstd", "gzip", "deflate", "br"):
             try:
                 body = decompress_body(body, req_content_encoding)
             except (ImportError, ValueError, OSError):
                 log.warning(f"[{ctx.req_id}] unsupported Content-Encoding: {req_content_encoding}, forwarding as-is")
-        fwd_headers["Accept-Encoding"] = "identity"
-        ctx.fwd_headers = fwd_headers
+        # 转发头走唯一入口：去 Host / 去 hop-by-hop / 强制 Accept-Encoding: identity
+        ctx.fwd_headers = prepare_fwd_headers(ctx.request.headers)
 
         try:
             parsed = orjson.loads(body) if body else None
@@ -179,10 +175,11 @@ class ForwardStage(Stage):
             ctx.response = web.Response(status=502, text="Transport not configured")
             return ctx
 
-        # 记录 upstream_name（从 Runtime 读取）
-        upstream_config = rt.upstream_config
-        if upstream_config is not None:
-            ctx.meta["upstream_name"] = getattr(upstream_config, 'upstream_name', 'default')
+        # 记录 upstream_name（请求级 ResolvedTarget——Runtime 是共享单例，
+        # 请求级数据必须从 request['upstream'] 读，否则日志永远显示 default）
+        upstream = ctx.request.get("upstream")
+        if upstream is not None:
+            ctx.meta["upstream_name"] = getattr(upstream, 'upstream_name', 'default')
 
         # 通过 Transport 获取上游响应
         resp = await rt.transport.fetch(ctx)
@@ -210,9 +207,17 @@ class ForwardStage(Stage):
 
     async def _handle_streaming(self, ctx: Context,
                                  stream: collections.abc.AsyncIterable[bytes]) -> None:
+        # 流式响应头只能在 prepare 之前注入（ReturnStage 执行时 SSE 头已发出，改不了）。
+        # 先剔除上游同名头（大小写不敏感）避免重复，再写 proxy 统一 ctx.req_id——
+        # 与非流式 ReturnStage 的 X-Request-Id 同一值，客户端可跨流式/非流式关联。
+        stream_headers = {
+            k: v for k, v in ctx.resp_headers.items()
+            if k.lower() != "x-request-id"
+        }
+        stream_headers["X-Request-Id"] = ctx.req_id
         resp = web.StreamResponse(
             status=200,
-            headers=ctx.resp_headers,
+            headers=stream_headers,
         )
         await resp.prepare(ctx.request)
         ctx.response = resp
@@ -266,6 +271,8 @@ class ReturnStage(Stage):
     async def process(self, ctx: Context) -> Context:
         ctx.should_abort = True
         # Inject proxy request_id into response headers for correlation
+        # （非流式：Response 尚未 prepare，可在此改头；流式头由 ForwardStage._handle_streaming
+        #   在 prepare 前注入同一 ctx.req_id）
         if ctx.response and not ctx.is_streaming:
             ctx.response.headers["X-Request-Id"] = ctx.req_id
         # Strip <summary> tags for compaction-rewritten responses

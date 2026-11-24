@@ -9,9 +9,7 @@ Copilot 每个 user turn 注入 <context> 块（日期、终端状态等），�
 
 剥离 <context> 和 <reminderInstructions> 块，保留 <userRequest>（用户实际输入）。
 
-2026-06-24: 实现后通过 inspector rebuild 验证，对命中率无改善（0% delta）。
-context_shift (32 events) 的根因是系统提示词变化，不是 <context> 块。
-已从管道中移除，代码保留供参考。
+注：该 Stage 当前未挂入默认管道（保留实现供需要时启用）。
 """
 from __future__ import annotations
 
